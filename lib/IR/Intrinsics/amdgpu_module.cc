@@ -23,6 +23,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -117,6 +118,9 @@ class AMDGPUIntrinsic : public NamedModule {
     mlir::Value CreateSchedGroupBarrierFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
+    mlir::Value CreateGlobalAtomicAddFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
 
   private:
     mlir::Value
@@ -157,6 +161,9 @@ class AMDGPUIntrinsic : public NamedModule {
                                llvm::ArrayRef<mlir::Value> resolved_args) const;
 
     bool CheckSchedGroupBarrierFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
+    bool CheckGlobalAtomicAddFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
 };
@@ -327,6 +334,19 @@ void AMDGPUIntrinsic::Initialize() {
             return CheckSchedGroupBarrierFunction(call_expr, gen_ctx,
                                                   resolved_args);
         });
+
+    AddFunction(
+        "atomic_add",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateGlobalAtomicAddFunction(call_expr, gen_ctx,
+                                                 resolved_args);
+        },
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+            return CheckGlobalAtomicAddFunction(call_expr, gen_ctx,
+                                                resolved_args);
+        });
 }
 
 void AMDGPUIntrinsic::DeclareModules(mlir::ModuleOp module) {
@@ -400,6 +420,41 @@ mlir::Value ConvertToIndex(mlir::OpBuilder &builder, mlir::Location location,
     }
     return mlir::arith::IndexCastOp::create(builder, location,
                                             builder.getIndexType(), value);
+}
+
+std::optional<mlir::Type> GetAtomicElementType(mlir::Type type) {
+    if (auto vectorType = mlir::dyn_cast<mlir::VectorType>(type)) {
+        if (vectorType.getRank() != 1) {
+            return std::nullopt;
+        }
+        return vectorType.getElementType();
+    }
+    return type;
+}
+
+bool IsSupportedAtomicAddType(mlir::Type type) {
+    if (type.isBF16() || type.isF16() || type.isF32() ||
+        type.isInteger(32) || type.isInteger(64)) {
+        return true;
+    }
+    auto vectorType = mlir::dyn_cast<mlir::VectorType>(type);
+    return vectorType && vectorType.getRank() == 1 &&
+           vectorType.getNumElements() == 2 &&
+           (vectorType.getElementType().isBF16() ||
+            vectorType.getElementType().isF16());
+}
+
+std::optional<llvm::StringRef> GetAtomicSyncScope(int64_t scope) {
+    switch (scope) {
+    case 0:
+        return "workgroup";
+    case 1:
+        return "agent";
+    case 2:
+        return "system";
+    default:
+        return std::nullopt;
+    }
 }
 } // namespace
 
@@ -1118,6 +1173,112 @@ bool AMDGPUIntrinsic::CheckSchedGroupBarrierFunction(
         return false;
     }
 
+    return true;
+}
+
+mlir::Value AMDGPUIntrinsic::CreateGlobalAtomicAddFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = GetCallLocation(ctx, call_expr);
+    auto scope = ConstantFolder::FoldIntValue(resolved_args[3]);
+    SS_ASSERT(scope);
+    auto syncScope = GetAtomicSyncScope(*scope);
+    SS_ASSERT(syncScope);
+
+    auto pointerIndex =
+        cf::AveLangMemRefExtractAlignedPointerAsIndexOp::create(
+            builder, location, builder.getIndexType(), resolved_args[2]);
+    auto baseAddress = mlir::arith::IndexCastOp::create(
+        builder, location, builder.getI64Type(), pointerIndex);
+    auto byteOffset = mlir::arith::ExtUIOp::create(
+        builder, location, builder.getI64Type(), resolved_args[0]);
+    auto address = mlir::arith::AddIOp::create(builder, location, baseAddress,
+                                                byteOffset);
+    auto pointer = mlir::LLVM::IntToPtrOp::create(
+        builder, location,
+        mlir::LLVM::LLVMPointerType::get(builder.getContext(), 1),
+        address.getResult(), nullptr);
+
+    auto elementType = *GetAtomicElementType(resolved_args[1].getType());
+    auto binOp = mlir::isa<mlir::FloatType>(elementType)
+                     ? mlir::LLVM::AtomicBinOp::fadd
+                     : mlir::LLVM::AtomicBinOp::add;
+    mlir::LLVM::AtomicRMWOp::create(
+        builder, location, binOp, pointer, resolved_args[1],
+        mlir::LLVM::AtomicOrdering::monotonic, *syncScope);
+
+    return ctx->GetCurrentFunctionGenerator()->GetExprGenerator()
+        ->CreateVoidValue();
+}
+
+bool AMDGPUIntrinsic::CheckGlobalAtomicAddFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    if (call_expr->GetArgs().size() != 4 || resolved_args.size() != 4) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "atomic_add() requires exactly 4 arguments: voffset, "
+               "data, tensor, scope";
+        return false;
+    }
+    for (auto value : resolved_args) {
+        if (!value) {
+            ctx->diagnostic_manager->Report(
+                basic::DiagnosticCode::kUnimplemented,
+                call_expr->GetSourceRange().getBegin())
+                << "Failed to generate operands for atomic_add()";
+            return false;
+        }
+    }
+    if (!resolved_args[0].getType().isInteger(32)) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "atomic_add() expects voffset to be i32";
+        return false;
+    }
+    auto tensorType = mlir::dyn_cast<cf::MemRefType>(resolved_args[2].getType());
+    if (!tensorType) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "atomic_add() expects tensor to be a tensor";
+        return false;
+    }
+    auto dataElementType = GetAtomicElementType(resolved_args[1].getType());
+    if (!dataElementType || !IsSupportedAtomicAddType(resolved_args[1].getType())) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "atomic_add() supports bf16, f16, f32, i32, i64, "
+               "vector<2xbf16>, and vector<2xf16> data";
+        return false;
+    }
+    if (*dataElementType != tensorType.getElementType()) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "atomic_add() requires data element type to match the "
+               "tensor element type";
+        return false;
+    }
+    if (!resolved_args[3].getType().isIntOrIndex()) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "atomic_add() expects scope to be an integer or index";
+        return false;
+    }
+    auto scope = ConstantFolder::FoldIntValue(resolved_args[3]);
+    if (!scope) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "atomic_add() requires a compile-time scope";
+        return false;
+    }
+    if (!GetAtomicSyncScope(*scope)) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "atomic_add() scope must be 0 (workgroup), 1 (agent), "
+               "or 2 (system)";
+        return false;
+    }
     return true;
 }
 

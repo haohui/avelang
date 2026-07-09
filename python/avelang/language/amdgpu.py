@@ -1,6 +1,16 @@
 """AMDGPU-specific language intrinsics."""
 
 
+class AtomicScope:
+    WORKGROUP = 0
+    AGENT = 1
+    SYSTEM = 2
+
+
+def atomic_add(voffset, data, tensor, scope):
+    pass
+
+
 def mfma_16x16x16_f16_f32(a, b, c):
     pass
 
