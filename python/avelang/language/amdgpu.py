@@ -31,6 +31,14 @@ def mfma_f32_32x32x8_bf16(a, b, c):
     pass
 
 
+def mfma_16x16x32_fp8_fp8(a, b, c):
+    pass
+
+
+def mfma_f32_16x16x32_fp8_fp8(a, b, c):
+    pass
+
+
 def make_rsrc(tensor, range_bytes):
     pass
 

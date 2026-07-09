@@ -51,6 +51,9 @@ from .core import (
 )
 
 __all__ = [
+    # Target-specific intrinsic modules
+    "amdgpu",
+    "nvvm",
     # Signed integer types
     "i8",
     "i16",
