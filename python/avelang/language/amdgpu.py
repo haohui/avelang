@@ -55,6 +55,10 @@ def v_setvskip(mask, skip_id):
     pass
 
 
+def readfirstlane(value):
+    pass
+
+
 def raw_buffer_load_x1(rsrc, vindex, soffset, aux):
     pass
 
