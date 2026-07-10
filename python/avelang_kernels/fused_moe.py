@@ -35,8 +35,8 @@ SHM_SCALE_X1_BASE = SHM_X1_BASE + INPUT_SHM_ELEMENTS
 SHM_MAX_BASE = STAGE_COUNT * INPUT_STAGE_DWORDS
 SHM_Q_H_BASE = SHM_MAX_BASE + THREADS * 2
 SHM_RET_BASE = SHM_Q_H_BASE + THREADS * 8
-SHM_TOTAL_DWORDS = SHM_RET_BASE + 4 * 0x88 * 8
 RET_DWORDS = 4 * 0x88 * 8
+SHM_TOTAL_DWORDS = SHM_RET_BASE + STAGE_COUNT * RET_DWORDS
 
 W13_TILE_LOADS = 8
 W2_TILE_LOADS = 8
@@ -730,9 +730,39 @@ def _to_bf16_rn(
 
 
 @avelang.jit
+def _stage2_write_shm(
+    shm_ret: S.Tensor((RET_DWORDS,), S.u32),
+    packed: S.Tensor((8, 2), S.u32),
+    wid: S.u32,
+    wtid: S.u32,
+):
+    idx_w = (wtid >> 4) * 34 + (wtid & 15) * 2 + wid * 136
+    for i in S.range(8):
+        col = i // 2
+        row = i % 2
+        write_off_dw = col * 544 + row * 2176
+        shm_ret[idx_w + write_off_dw] = packed[i, 0]
+        shm_ret[idx_w + write_off_dw + 1] = packed[i, 1]
+
+
+@avelang.jit
+def _stage2_read_shm(
+    packed: S.Tensor((8, 2), S.u32),
+    shm_ret: S.Tensor((RET_DWORDS,), S.u32),
+    wid: S.u32,
+    wtid: S.u32,
+):
+    idx_r = (wtid >> 1) * 34 + (wtid & 1) + wid * 2
+    for i in S.range(8):
+        read_off_dw = (i // 4) * 2176 + (i % 4) * 8
+        packed[i, 0] = shm_ret[idx_r + read_off_dw]
+        packed[i, 1] = shm_ret[idx_r + read_off_dw + 1088]
+
+
+@avelang.jit
 def _stage2_write_back(
     out_bf16: S.Tensor((2,), S.bf16),
-    shm_ret: S.Tensor((RET_DWORDS,), S.u32),
+    packed: S.Tensor((8, 2), S.u32),
     tokens: S.Tensor((TOKEN_BATCH,), S.u32),
     num_tokens: S.u32,
     dim: S.u32,
@@ -740,17 +770,13 @@ def _stage2_write_back(
     wid: S.u32,
     wtid: S.u32,
 ):
-    idx_r = (wtid >> 1) * 34 + (wtid & 1) + wid * 2
     for i in S.range(8):
-        read_off_dw = (i // 4) * 2176 + (i % 4) * 8
-        o0 = shm_ret[idx_r + read_off_dw]
-        o1 = shm_ret[idx_r + read_off_dw + 1088]
         if tokens[i] < num_tokens:
             voffset_bytes = (tokens[i] * dim + d + wtid * 2) * 2
             o0_words = S.make_local((1,), S.u32)
             o1_words = S.make_local((1,), S.u32)
-            o0_words[0] = o0
-            o1_words[0] = o1
+            o0_words[0] = packed[i, 0]
+            o1_words[0] = packed[i, 1]
             o0_bf16 = S.view(o0_words, S.Tensor((1, 2), S.bf16))[0]
             o1_bf16 = S.view(o1_words, S.Tensor((1, 2), S.bf16))[0]
             S.amdgpu.atomic_add(
@@ -764,7 +790,8 @@ def _stage2_write_back(
 @avelang.jit
 def _stage2(
     out_bf16: S.Tensor((2,), S.bf16),
-    shm_ret: S.Tensor((RET_DWORDS,), S.u32),
+    shm_ret0: S.Tensor((RET_DWORDS,), S.u32),
+    shm_ret1: S.Tensor((RET_DWORDS,), S.u32),
     quant_h: S.Tensor((8, 4), S.u32),
     dq_act: S.Tensor((4,), S.f32),
     sorted_weights: S.Tensor((2,), S.f32),
@@ -780,39 +807,81 @@ def _stage2(
     w2_base_value_offset_bytes: S.u32,
     w2_base_scale_offset_bytes: S.u32,
 ):
-    w2_stage0 = S.make_local((8, 4), S.u32)
-    w2_stage1 = S.make_local((8, 4), S.u32)
+    w2_curr_stage0 = S.make_local((8, 4), S.u32)
+    w2_curr_stage1 = S.make_local((8, 4), S.u32)
+    w2_next_stage0 = S.make_local((8, 4), S.u32)
+    w2_next_stage1 = S.make_local((8, 4), S.u32)
+    scale_w2 = S.make_local((2,), S.f32)
     w2_value_offset_bytes = w2_base_value_offset_bytes
     w2_scale_offset_bytes = w2_base_scale_offset_bytes
 
-    for d in S.range(dim // GROUP_N):
-        t = S.make_local((8, 4), S.f32)
-        _clear_f32x4_matrix(t)
+    _w2_load_tile_stage0(w2_curr_stage0, w2_rsrc, w2_value_offset_bytes, inter_dim, wid, wtid)
+    _w2_load_tile_stage1(w2_curr_stage1, w2_rsrc, w2_value_offset_bytes, inter_dim, wid, wtid)
+    scale_w2[0] = _w2_load_scale(w2_scale_rsrc, inter_dim, tid, w2_scale_offset_bytes)
+    w2_value_offset_bytes = w2_value_offset_bytes + inter_dim * GROUP_N
+    w2_scale_offset_bytes = w2_scale_offset_bytes + (inter_dim // SCALE_BLOCK_SIZE) * 8
 
-        _w2_load_tile_stage0(w2_stage0, w2_rsrc, w2_value_offset_bytes, inter_dim, wid, wtid)
-        _w2_load_tile_stage1(w2_stage1, w2_rsrc, w2_value_offset_bytes, inter_dim, wid, wtid)
-        scale_w2 = _w2_load_scale(w2_scale_rsrc, inter_dim, tid, w2_scale_offset_bytes)
-        _matmul_stage0(t, w2_stage0, quant_h, dq_act, scale_w2)
-        _matmul_stage1(t, w2_stage1, quant_h, dq_act, scale_w2)
+    zeroes = S.make_local((8, 2), S.u32)
+    for i in S.range(8):
+        zeroes[i, 0] = S.convert(0, S.u32)
+        zeroes[i, 1] = S.convert(0, S.u32)
+    _stage2_write_shm(shm_ret1, zeroes, wid, wtid)
 
-        _multiply_route_weights(t, sorted_weights)
+    stage2_iters = (dim + 2 * GROUP_N - 1) // (2 * GROUP_N)
+    for iter_idx in S.range(stage2_iters):
+        d = iter_idx * (2 * GROUP_N)
+        for curr in S.range(2):
+            tile_d = d + curr * GROUP_N
+            if tile_d >= dim:
+                break
+            S.syncthreads()
 
-        for i in S.range(8):
-            o = S.make_local((2,), S.u32)
-            _to_bf16_rn(o, t[i])
-            col = i // 2
-            row = i % 2
-            idx_w = (wtid >> 4) * 34 + (wtid & 15) * 2 + wid * 136
-            write_off_dw = col * 544 + row * 2176
-            shm_ret[idx_w + write_off_dw] = o[0]
-            shm_ret[idx_w + write_off_dw + 1] = o[1]
-        S.syncthreads()
+            t = S.make_local((8, 4), S.f32)
+            _clear_f32x4_matrix(t)
+            ret = S.make_local((8, 2), S.u32)
+            if curr == 0:
+                if tile_d + GROUP_N < dim:
+                    _w2_load_tile_stage0(w2_next_stage0, w2_rsrc, w2_value_offset_bytes, inter_dim, wid, wtid)
+                    _w2_load_tile_stage1(w2_next_stage1, w2_rsrc, w2_value_offset_bytes, inter_dim, wid, wtid)
+                    scale_w2[1] = _w2_load_scale(w2_scale_rsrc, inter_dim, tid, w2_scale_offset_bytes)
+                    w2_value_offset_bytes = w2_value_offset_bytes + inter_dim * GROUP_N
+                    w2_scale_offset_bytes = w2_scale_offset_bytes + (inter_dim // SCALE_BLOCK_SIZE) * 8
+                _stage2_read_shm(ret, shm_ret1, wid, wtid)
+                _matmul_stage0(t, w2_curr_stage0, quant_h, dq_act, scale_w2[0])
+                _matmul_stage1(t, w2_curr_stage1, quant_h, dq_act, scale_w2[0])
+            else:
+                if tile_d + GROUP_N < dim:
+                    _w2_load_tile_stage0(w2_curr_stage0, w2_rsrc, w2_value_offset_bytes, inter_dim, wid, wtid)
+                    _w2_load_tile_stage1(w2_curr_stage1, w2_rsrc, w2_value_offset_bytes, inter_dim, wid, wtid)
+                    scale_w2[0] = _w2_load_scale(w2_scale_rsrc, inter_dim, tid, w2_scale_offset_bytes)
+                    w2_value_offset_bytes = w2_value_offset_bytes + inter_dim * GROUP_N
+                    w2_scale_offset_bytes = w2_scale_offset_bytes + (inter_dim // SCALE_BLOCK_SIZE) * 8
+                _stage2_read_shm(ret, shm_ret0, wid, wtid)
+                _matmul_stage0(t, w2_next_stage0, quant_h, dq_act, scale_w2[1])
+                _matmul_stage1(t, w2_next_stage1, quant_h, dq_act, scale_w2[1])
 
-        _stage2_write_back(out_bf16, shm_ret, tokens, num_tokens, dim, d * GROUP_N, wid, wtid)
-        S.syncthreads()
+            _multiply_route_weights(t, sorted_weights)
+            packed = S.make_local((8, 2), S.u32)
+            for i in S.range(8):
+                _to_bf16_rn(packed[i], t[i])
 
-        w2_value_offset_bytes = w2_value_offset_bytes + inter_dim * GROUP_N
-        w2_scale_offset_bytes = w2_scale_offset_bytes + (inter_dim // SCALE_BLOCK_SIZE) * 8
+            if curr == 0:
+                _stage2_write_shm(shm_ret0, packed, wid, wtid)
+            else:
+                _stage2_write_shm(shm_ret1, packed, wid, wtid)
+
+            if tile_d != 0:
+                _stage2_write_back(out_bf16, ret, tokens, num_tokens, dim, tile_d - GROUP_N, wid, wtid)
+            S.syncthreads()
+
+    S.syncthreads()
+    ret = S.make_local((8, 2), S.u32)
+    last_stage = (dim // GROUP_N - 1) % STAGE_COUNT
+    if last_stage == 0:
+        _stage2_read_shm(ret, shm_ret0, wid, wtid)
+    else:
+        _stage2_read_shm(ret, shm_ret1, wid, wtid)
+    _stage2_write_back(out_bf16, ret, tokens, num_tokens, dim, dim - GROUP_N, wid, wtid)
 
 
 @avelang.jit
@@ -889,7 +958,8 @@ def _fused_moe_blockscale_fp8_kernel(
     shm_max_words = S.subview(shared_words, (SHM_MAX_BASE,), (THREADS * 2,), (1,))
     shm_max = S.view(shm_max_words, S.f32, S.make_layout((THREADS, 2), (2, 1)))
     shm_q_h = S.subview(shared_words, (SHM_Q_H_BASE,), (THREADS * 8,), (1,))
-    shm_ret = S.subview(shared_words, (SHM_RET_BASE,), (RET_DWORDS,), (1,))
+    shm_ret0 = S.subview(shared_words, (SHM_RET_BASE,), (RET_DWORDS,), (1,))
+    shm_ret1 = S.subview(shared_words, (SHM_RET_BASE + RET_DWORDS,), (RET_DWORDS,), (1,))
 
     w1_value_offset_bytes = expert_id * (2 * inter_dim * dim) + tile_k * GROUP_DIM * dim
     w1_scale_offset_bytes = (expert_id * (2 * k_blocks * n_blocks) + tile_k * (GROUP_DIM // SCALE_BLOCK_SIZE) * n_blocks) * 4
@@ -937,7 +1007,8 @@ def _fused_moe_blockscale_fp8_kernel(
 
     _stage2(
         out_bf16,
-        shm_ret,
+        shm_ret0,
+        shm_ret1,
         quant_h,
         dq_act,
         sorted_weights,
