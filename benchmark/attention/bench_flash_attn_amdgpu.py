@@ -86,7 +86,7 @@ def _launch_avelang_flash_attn(
     seq_lens: list[int],
 ) -> None:
     row_tiles = math.ceil(max(seq_lens) / flash_attn.BLOCK_ROWS)
-    physical_tiles = row_tiles
+    physical_tiles = math.ceil(row_tiles / 2)
     q_heads = q.shape[1]
     kv_heads = k.shape[1]
     flash_attn._flash_attn_packed_kernel[lambda: ((physical_tiles, q_heads, len(seq_lens)), (flash_attn.THREADS, 1, 1))](

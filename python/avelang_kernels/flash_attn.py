@@ -238,9 +238,15 @@ def _load_q_reg_words_lds_strided(
             global_soffset = global_sword * U32_BYTES
             lds_row = wid + (word_batch * NUM_WARPS)
             lds_word = lds_row * QK_ROW_STRIDE_WORDS
-            q_words[lds_word + (tid % WARP_SIZE)] = al.bitcast(
-                al.amdgpu.raw_buffer_load_x1(q_rsrc, global_voffset, global_soffset, 0),
-                al.u32,
+            lds_offset = lds_word * U32_BYTES
+            al.amdgpu.raw_buffer_load_x1_lds(
+                q_rsrc,
+                q_words,
+                U32_BYTES,
+                global_voffset,
+                global_soffset,
+                lds_offset,
+                0,
             )
         al.amdgpu.s_waitcnt(0, 7, 15)
         al.syncthreads()
@@ -1105,7 +1111,7 @@ def _flash_attn_packed_kernel(
     num_q_tiles = al.amdgpu.readfirstlane(
         (seq_len + BLOCK_ROWS - 1) // BLOCK_ROWS
     )
-    physical_tiles = num_q_tiles
+    physical_tiles = al.amdgpu.readfirstlane((num_q_tiles + 1) // 2)
     if physical_q_tile_idx >= physical_tiles:
         return
     # al.assume(physical_q_tile_idx < physical_tiles)
@@ -1136,6 +1142,9 @@ def _flash_attn_packed_kernel(
 
     q_head_idx = physical_q_head_idx
     head_idx_q = physical_q_tile_idx
+    merged_head_tile = (physical_q_head_idx & 7) * physical_tiles + physical_q_tile_idx
+    q_head_idx = (physical_q_head_idx // 8) * 8 + (merged_head_tile & 7)
+    head_idx_q = merged_head_tile >> 3
     kv_head_idx = q_head_idx // (Q_HEADS // KV_HEADS)
     q_row_stride_elems = Q_HEADS * HEAD_DIM
     kv_row_stride_elems = KV_HEADS * HEAD_DIM
@@ -1152,7 +1161,10 @@ def _flash_attn_packed_kernel(
     q_row_stride_words = q_row_stride_elems // 2
     kv_row_stride_words = kv_row_stride_elems // 2
 
+    mirrored_idx_q = num_q_tiles - 1 - head_idx_q
     num_passes = 1
+    if mirrored_idx_q != head_idx_q:
+        num_passes = 2
     tile_idx = head_idx_q
     reverse_pass = 0
     for _ in al.range(num_passes):
@@ -1215,9 +1227,15 @@ def _load_k_page_strided(
         lds_word = page_word_base + lds_row * QK_ROW_STRIDE_WORDS
         global_voffset = global_vword * U32_BYTES
         global_soffset = global_sword * U32_BYTES
-        k_words[lds_word + (tid % WARP_SIZE)] = al.bitcast(
-            al.amdgpu.raw_buffer_load_x1(k_rsrc, global_voffset, global_soffset, 0),
-            al.u32,
+        lds_offset = lds_word * U32_BYTES
+        al.amdgpu.raw_buffer_load_x1_lds(
+            k_rsrc,
+            k_words,
+            U32_BYTES,
+            global_voffset,
+            global_soffset,
+            lds_offset,
+            0,
         )
 
 
@@ -1251,7 +1269,7 @@ def flash_attn(
     kv_heads = k.shape[1]
     seq_ptr_device = seq_ptr.to(device=q.device, dtype=torch.int32)
     row_tiles = math.ceil(max_seq_len / BLOCK_ROWS)
-    physical_tiles = row_tiles
+    physical_tiles = math.ceil(row_tiles / 2)
     _flash_attn_packed_kernel[lambda: ((physical_tiles, q_heads, len(seq_ptr_cpu) - 1), (THREADS, 1, 1))](
         q,
         k,
