@@ -175,16 +175,28 @@ def _validate_packed_flash_attn_inputs(
 
 @avelang.jit
 def _hot_loop_scheduler_qk_major():
+    for _ in al.range(SCHED_INST_ALU_LIGHT):
+        al.amdgpu.sched_group_barrier(SCHED_MASK_VALU, 1, 0)
+        al.amdgpu.sched_group_barrier(SCHED_MASK_MFMA, QK_MAJOR_MFMA_PER_ISSUE, 0)
     al.amdgpu.sched_barrier(0)
 
 
 @avelang.jit
 def _hot_loop_scheduler_qk_minor():
+    for _ in al.range(SCHED_INST_ALU_LIGHT):
+        al.amdgpu.sched_group_barrier(SCHED_MASK_VALU, 1, 0)
+        al.amdgpu.sched_group_barrier(SCHED_MASK_MFMA, QK_MINOR_MFMA_PER_ISSUE, 0)
     al.amdgpu.sched_barrier(0)
 
 
 @avelang.jit
 def _hot_loop_scheduler_gemm_o():
+    for _ in al.range(SCHED_INST_ALU_MEDIUM):
+        al.amdgpu.sched_group_barrier(SCHED_MASK_VALU, 1, 0)
+        al.amdgpu.sched_group_barrier(SCHED_MASK_MFMA, GEMM_O_MFMA_PER_ISSUE, 0)
+    for _ in al.range(SCHED_INST_TRANS_HEAVY):
+        al.amdgpu.sched_group_barrier(SCHED_MASK_TRANS, 1, 0)
+        al.amdgpu.sched_group_barrier(SCHED_MASK_MFMA, GEMM_O_MFMA_PER_ISSUE, 0)
     al.amdgpu.sched_barrier(0)
 
 
