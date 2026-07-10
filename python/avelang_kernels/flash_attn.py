@@ -537,22 +537,31 @@ def _store_v_global_slice_packed(
     wtid: al.u32,
     v_slice: al.u32,
 ):
-    v_store_words = al.subview(work_words, (SHM_V_OFFSET_WORDS,), (SHM_V_WORDS,), (1,))
-    work_v = al.view(
-        v_store_words,
+    work_u2 = al.view(
+        work_words,
         al.u32,
         al.make_layout(
-            (K_SLICE_ROWS, V_COLS_U32),
-            (V_COLS_U32, 1),
+            (SHM_WORK_WORDS // 2, 2),
+            (2, 1),
         ),
     )
     col_u32 = wtid % V_COLS_U32
     rowpair_group = wid * V_ROWPAIR_GROUPS_PER_WARP + wtid // V_COLS_U32
-    row_base = rowpair_group * 4
-    work_v[row_base, col_u32] = g_v[0]
-    work_v[row_base + 1, col_u32] = g_v[1]
-    work_v[row_base + 2, col_u32] = g_v[2]
-    work_v[row_base + 3, col_u32] = g_v[3]
+    even0 = al.amdgpu.perm(g_v[1], g_v[0], 0x05040100)
+    even1 = al.amdgpu.perm(g_v[3], g_v[2], 0x05040100)
+    odd0 = al.amdgpu.perm(g_v[1], g_v[0], 0x07060302)
+    odd1 = al.amdgpu.perm(g_v[3], g_v[2], 0x07060302)
+    shm_idx = rowpair_group * V_LOGICAL_ROW_STRIDE_U32 + col_u32
+    addr_adjust = al.convert(wid == 0, al.u32)
+    even_base = SHM_V_OFFSET_WORDS // 2 + addr_adjust
+    odd_base = SHM_V_OFFSET_WORDS // 2 + V_HALF_U2 + addr_adjust
+    local_idx = shm_idx - addr_adjust
+    even_idx = even_base + local_idx
+    odd_idx = odd_base + local_idx
+    work_u2[even_idx, 0] = even0
+    work_u2[even_idx, 1] = even1
+    work_u2[odd_idx, 0] = odd0
+    work_u2[odd_idx, 1] = odd1
 
 
 @avelang.jit
@@ -563,31 +572,33 @@ def _fetch_v_reg_words_batch_compact(
     wtid: al.u32,
     k_batch: al.u32,
 ):
-    v_matrix = al.view(
+    v_pair = al.view(
         v_words,
-        al.bf16,
+        al.u32,
         al.make_layout(
-            (K_SLICE_ROWS, HEAD_DIM),
-            (HEAD_DIM, 1),
+            (2, O_BATCHES, WARP_ROWS // 2, 2, 2, 2, 2),
+            (
+                (SCORE_TILE_COLS // 4) * V_LOGICAL_ROW_STRIDE_U32 * 2,
+                (WARP_ROWS // 2) * 2,
+                2,
+                V_LOGICAL_ROW_STRIDE_U32 * 2,
+                V_HALF_U2 * 2,
+                (SCORE_TILE_COLS // 4 // 2) * V_LOGICAL_ROW_STRIDE_U32 * 2,
+                1,
+            ),
         ),
     )
     lane_half = wtid // WARP_ROWS
-    lane_col = wtid % WARP_ROWS
-    gathered = al.make_local((8,), al.bf16)
+    lane_pair = (wtid % WARP_ROWS) // 2
+    lane_parity = wtid & 1
 
     for o_batch in al.range(O_BATCHES):
-        col = o_batch * WARP_ROWS + lane_col
         for v_chunk in al.range(2):
-            row_base = v_chunk * SCORE_TILE_COLS + lane_half * 4
-            for gather_half in al.range(2):
-                gather_row_base = row_base + gather_half * 8
-                for elem in al.range(4):
-                    gathered[gather_half * 4 + elem] = v_matrix[gather_row_base + elem, col]
-            packed = al.view(gathered, al.Tensor((4,), al.u32))
-            v_regs[o_batch, v_chunk * 2, 0] = packed[0]
-            v_regs[o_batch, v_chunk * 2, 1] = packed[1]
-            v_regs[o_batch, v_chunk * 2 + 1, 0] = packed[2]
-            v_regs[o_batch, v_chunk * 2 + 1, 1] = packed[3]
+            packed = v_pair[v_chunk, o_batch, lane_pair, lane_half, lane_parity]
+            v_regs[o_batch, v_chunk * 2, 0] = packed[0, 0]
+            v_regs[o_batch, v_chunk * 2, 1] = packed[0, 1]
+            v_regs[o_batch, v_chunk * 2 + 1, 0] = packed[1, 0]
+            v_regs[o_batch, v_chunk * 2 + 1, 1] = packed[1, 1]
 
 
 @avelang.jit
