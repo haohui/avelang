@@ -888,6 +888,324 @@ def _flash_attn_compute_qk_page(
                 actual_key_base,
                 lane_half,
             )
+            
+
+@avelang.jit
+def _flash_attn_compute_qk_page_loaded(
+    k_stage_words: al.Tensor((SHM_V_OFFSET_WORDS,), al.u32),
+    q_regs: al.Tensor((Q_BATCHES, 2, 2), al.u32),
+    score_acc: al.Tensor((K_BATCHES, 16), al.f32),
+    key_row_local: al.u32,
+    lane_half: al.u32,
+    global_query_row: al.u32,
+    seq_len: al.u32,
+    actual_key_base: al.u32,
+    first_causal_key_base: al.u32,
+    page: al.u32,
+):
+    k_regs = al.make_local((Q_BATCHES, 2, 2), al.u32)
+    _fetch_k_reg_words_page_small(k_regs, k_stage_words, key_row_local, lane_half, page)
+    if page == 0:
+        _gemm_qk_word_regs_batch0_small(score_acc, q_regs, k_regs)
+    else:
+        _gemm_qk_word_regs_batch1_small(score_acc, q_regs, k_regs)
+    if actual_key_base >= first_causal_key_base:
+        if page == 0:
+            _apply_lower_causal_mask_batch0_at_key_base(
+                score_acc,
+                global_query_row,
+                actual_key_base,
+                lane_half,
+            )
+        else:
+            _apply_lower_causal_mask_batch1_at_key_base(
+                score_acc,
+                global_query_row,
+                actual_key_base,
+                lane_half,
+            )
+            
+
+@avelang.jit
+def _flash_attn_packed_pair_step_wg0(
+    k_stage_words: al.Tensor((SHM_V_OFFSET_WORDS,), al.u32),
+    work_words: al.Tensor((SHM_WORK_WORDS,), al.u32),
+    v_words: al.Tensor((SHM_V_WORDS,), al.u32),
+    k_rsrc: al.Tensor((4,), al.u32),
+    v_rsrc: al.Tensor((4,), al.u32),
+    q_regs: al.Tensor((Q_BATCHES, 2, 2), al.u32),
+    v_regs: al.Tensor((O_BATCHES, 4, 2), al.u32),
+    g_v0: al.Tensor((4,), al.u32),
+    g_v1: al.Tensor((4,), al.u32),
+    score_acc: al.Tensor((K_BATCHES, 16), al.f32),
+    out_acc: al.Tensor((O_BATCHES, 16), al.f32),
+    softmax_state: al.Tensor((2,), al.f32),
+    tid: al.u32,
+    wid: al.u32,
+    wtid: al.u32,
+    key_row_local: al.u32,
+    lane_half: al.u32,
+    global_query_row: al.u32,
+    seq_len: al.u32,
+    pair_idx: al.u32,
+    max_k_slice: al.u32,
+    actual_odd_key_base: al.u32,
+    actual_next_even_key_base: al.u32,
+    first_causal_key_base: al.u32,
+    kv_row_stride_words: al.u32,
+    scale_log2: al.f32,
+):
+    odd_slice = pair_idx * 2 + 1
+    next_even_slice = odd_slice + 1
+
+    _flash_attn_compute_qk_page_loaded(
+        k_stage_words,
+        q_regs,
+        score_acc,
+        key_row_local,
+        lane_half,
+        global_query_row,
+        seq_len,
+        actual_odd_key_base,
+        first_causal_key_base,
+        1,
+    )
+    al.syncthreads()
+    _fetch_v_global_slice_packed_strided(
+        g_v1,
+        v_rsrc,
+        wid,
+        wtid,
+        actual_odd_key_base,
+        kv_row_stride_words,
+        0,
+    )
+    al.syncthreads()
+
+    al.amdgpu.s_waitcnt(0, 7, 15)
+    _store_v_global_slice_packed(work_words, g_v0, wid, wtid, 0)
+    al.syncthreads()
+    _fetch_v_reg_words_batch_compact(v_regs, v_words, key_row_local, wtid, 0)
+    _flash_attn_update_o_batch0(
+        score_acc,
+        out_acc,
+        v_regs,
+        softmax_state,
+        pair_idx * 2,
+        lane_half,
+        wtid,
+        scale_log2,
+    )
+    al.syncthreads()
+
+    if next_even_slice <= max_k_slice:
+        al.amdgpu.s_waitcnt(0, 7, 15)
+        al.syncthreads()
+        _flash_attn_compute_qk_page_loaded(
+            k_stage_words,
+            q_regs,
+            score_acc,
+            key_row_local,
+            lane_half,
+            global_query_row,
+            seq_len,
+            actual_next_even_key_base,
+            first_causal_key_base,
+            0,
+        )
+        al.syncthreads()
+        _fetch_v_global_slice_packed_strided(
+            g_v0,
+            v_rsrc,
+            wid,
+            wtid,
+            actual_next_even_key_base,
+            kv_row_stride_words,
+            0,
+        )
+        al.syncthreads()
+        al.amdgpu.s_waitcnt(0, 7, 15)
+        _store_v_global_slice_packed(work_words, g_v1, wid, wtid, 1)
+        al.syncthreads()
+        _fetch_v_reg_words_batch_compact(v_regs, v_words, key_row_local, wtid, 1)
+        _flash_attn_update_o_batch1(
+            score_acc,
+            out_acc,
+            v_regs,
+            softmax_state,
+            odd_slice,
+            lane_half,
+            wtid,
+            scale_log2,
+        )
+        al.syncthreads()
+
+
+@avelang.jit
+def _flash_attn_packed_pair_step_wg1(
+    k_stage_words: al.Tensor((SHM_V_OFFSET_WORDS,), al.u32),
+    work_words: al.Tensor((SHM_WORK_WORDS,), al.u32),
+    v_words: al.Tensor((SHM_V_WORDS,), al.u32),
+    k_rsrc: al.Tensor((4,), al.u32),
+    v_rsrc: al.Tensor((4,), al.u32),
+    q_regs: al.Tensor((Q_BATCHES, 2, 2), al.u32),
+    v_regs: al.Tensor((O_BATCHES, 4, 2), al.u32),
+    g_v0: al.Tensor((4,), al.u32),
+    g_v1: al.Tensor((4,), al.u32),
+    score_acc: al.Tensor((K_BATCHES, 16), al.f32),
+    out_acc: al.Tensor((O_BATCHES, 16), al.f32),
+    softmax_state: al.Tensor((2,), al.f32),
+    tid: al.u32,
+    wid: al.u32,
+    wtid: al.u32,
+    key_row_local: al.u32,
+    lane_half: al.u32,
+    global_query_row: al.u32,
+    seq_len: al.u32,
+    pair_idx: al.u32,
+    max_k_slice: al.u32,
+    actual_odd_key_base: al.u32,
+    actual_next_even_key_base: al.u32,
+    first_causal_key_base: al.u32,
+    kv_row_stride_words: al.u32,
+    scale_log2: al.f32,
+):
+    odd_slice = pair_idx * 2 + 1
+    next_even_slice = odd_slice + 1
+
+    _fetch_v_global_slice_packed_strided(
+        g_v1,
+        v_rsrc,
+        wid,
+        wtid,
+        actual_odd_key_base,
+        kv_row_stride_words,
+        0,
+    )
+    al.syncthreads()
+    _flash_attn_compute_qk_page_loaded(
+        k_stage_words,
+        q_regs,
+        score_acc,
+        key_row_local,
+        lane_half,
+        global_query_row,
+        seq_len,
+        actual_odd_key_base,
+        first_causal_key_base,
+        1,
+    )
+    al.syncthreads()
+
+    al.amdgpu.s_waitcnt(0, 7, 15)
+    _store_v_global_slice_packed(work_words, g_v0, wid, wtid, 0)
+    al.syncthreads()
+    _fetch_v_reg_words_batch_compact(v_regs, v_words, key_row_local, wtid, 0)
+    _flash_attn_update_o_batch0(
+        score_acc,
+        out_acc,
+        v_regs,
+        softmax_state,
+        pair_idx * 2,
+        lane_half,
+        wtid,
+        scale_log2,
+    )
+    al.syncthreads()
+
+    if next_even_slice <= max_k_slice:
+        _fetch_v_global_slice_packed_strided(
+            g_v0,
+            v_rsrc,
+            wid,
+            wtid,
+            actual_next_even_key_base,
+            kv_row_stride_words,
+            0,
+        )
+        al.syncthreads()
+        al.amdgpu.s_waitcnt(0, 7, 15)
+        al.syncthreads()
+        _flash_attn_compute_qk_page_loaded(
+            k_stage_words,
+            q_regs,
+            score_acc,
+            key_row_local,
+            lane_half,
+            global_query_row,
+            seq_len,
+            actual_next_even_key_base,
+            first_causal_key_base,
+            0,
+        )
+        al.syncthreads()
+        al.amdgpu.s_waitcnt(0, 7, 15)
+        _store_v_global_slice_packed(work_words, g_v1, wid, wtid, 1)
+        al.syncthreads()
+        _fetch_v_reg_words_batch_compact(v_regs, v_words, key_row_local, wtid, 1)
+        _flash_attn_update_o_batch1(
+            score_acc,
+            out_acc,
+            v_regs,
+            softmax_state,
+            odd_slice,
+            lane_half,
+            wtid,
+            scale_log2,
+        )
+        al.syncthreads()
+
+
+@avelang.jit
+def _flash_attn_packed_drain_epilogue(
+    work_words: al.Tensor((SHM_WORK_WORDS,), al.u32),
+    v_words: al.Tensor((SHM_V_WORDS,), al.u32),
+    score_acc: al.Tensor((K_BATCHES, 16), al.f32),
+    out_acc: al.Tensor((O_BATCHES, 16), al.f32),
+    v_regs: al.Tensor((O_BATCHES, 4, 2), al.u32),
+    g_v0: al.Tensor((4,), al.u32),
+    g_v1: al.Tensor((4,), al.u32),
+    softmax_state: al.Tensor((2,), al.f32),
+    wid: al.u32,
+    wtid: al.u32,
+    key_row_local: al.u32,
+    lane_half: al.u32,
+    max_k_slice: al.u32,
+    scale_log2: al.f32,
+):
+    epilogue_uses_s1 = (max_k_slice & 1) != 0
+    if epilogue_uses_s1:
+        _flash_attn_prepare_o_batch1(
+            score_acc,
+            out_acc,
+            softmax_state,
+            max_k_slice,
+            lane_half,
+            wtid,
+            scale_log2,
+        )
+    else:
+        _flash_attn_prepare_o_batch0(
+            score_acc,
+            out_acc,
+            softmax_state,
+            max_k_slice,
+            lane_half,
+            wtid,
+            scale_log2,
+        )
+    if epilogue_uses_s1:
+        al.amdgpu.s_waitcnt(0, 7, 15)
+        _store_v_global_slice_packed(work_words, g_v1, wid, wtid, 1)
+        al.syncthreads()
+        _fetch_v_reg_words_batch_compact(v_regs, v_words, key_row_local, wtid, 1)
+        _gemm_o_mfma_v_word_regs_batch1_direct(out_acc, score_acc, v_regs)
+    if not epilogue_uses_s1:
+        al.amdgpu.s_waitcnt(0, 7, 15)
+        _store_v_global_slice_packed(work_words, g_v0, wid, wtid, 0)
+        al.syncthreads()
+        _fetch_v_reg_words_batch_compact(v_regs, v_words, key_row_local, wtid, 0)
+        _gemm_o_mfma_v_word_regs_batch0_direct(out_acc, score_acc, v_regs)
 
 
 @avelang.jit
