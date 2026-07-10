@@ -12,7 +12,7 @@ import torch
 import torch.nn.functional as F
 
 from avelang.testing import has_rocm
-from avelang_kernels.moe import fused_moe_fp8_blockscale_g1u1
+from avelang_kernels.fused_moe import fused_moe_fp8_blockscale_g1u1
 
 
 BLOCK = 128

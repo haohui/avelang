@@ -20,15 +20,19 @@ SUBGROUP_SIZE = 16
 VEC_SIZE = 16
 ROUTES_PER_BLOCK = TOKEN_BATCH * NUM_WARPS
 REF_BUFFER_RANGE = 0xFFFFFFF0
+STAGE_COUNT = 2
 
 INPUT_SHM_PADDING_BYTES = 32 * NUM_WARPS
 INPUT_SHM_ELEMENTS = TOKEN_BATCH * THREADS + INPUT_SHM_PADDING_BYTES // 4
 INPUT_SHM_ELEMENTS_PER_WARP = INPUT_SHM_ELEMENTS // NUM_WARPS
 INPUT_SHM_VEC4_PER_WARP = INPUT_SHM_ELEMENTS_PER_WARP // 4
+INPUT_STAGE_DWORDS = INPUT_SHM_ELEMENTS + THREADS
 
-SHM_X_BASE = 0
-SHM_SCALE_X_BASE = SHM_X_BASE + INPUT_SHM_ELEMENTS
-SHM_MAX_BASE = SHM_SCALE_X_BASE + THREADS
+SHM_X0_BASE = 0
+SHM_SCALE_X0_BASE = SHM_X0_BASE + INPUT_SHM_ELEMENTS
+SHM_X1_BASE = INPUT_STAGE_DWORDS
+SHM_SCALE_X1_BASE = SHM_X1_BASE + INPUT_SHM_ELEMENTS
+SHM_MAX_BASE = STAGE_COUNT * INPUT_STAGE_DWORDS
 SHM_Q_H_BASE = SHM_MAX_BASE + THREADS * 2
 SHM_RET_BASE = SHM_Q_H_BASE + THREADS * 8
 SHM_TOTAL_DWORDS = SHM_RET_BASE + 4 * 0x88 * 8
@@ -241,13 +245,14 @@ def _w2_load_scale(
 def _input_fetch_async(
     shared_words: S.Tensor((SHM_TOTAL_DWORDS,), S.u32),
     values_rsrc: S.Tensor((4,), S.u32),
+    shm_x_base: S.u32,
     dim: S.u32,
     d: S.u32,
     wid: S.u32,
     wtid: S.u32,
     tokens: S.Tensor((TOKEN_BATCH,), S.u32),
 ):
-    warp_base_bytes = (SHM_X_BASE + wid * INPUT_SHM_ELEMENTS_PER_WARP) * 4
+    warp_base_bytes = (shm_x_base + wid * INPUT_SHM_ELEMENTS_PER_WARP) * 4
     vindex = wtid * 4
     for i in S.range(TOKEN_BATCH):
         src_off = tokens[i] * dim + d
@@ -279,6 +284,7 @@ def _input_fetch_to_regs(
 def _input_fetch_scale_async(
     shared_words: S.Tensor((SHM_TOTAL_DWORDS,), S.u32),
     scales_rsrc: S.Tensor((4,), S.u32),
+    shm_scale_base: S.u32,
     m: S.u32,
     d: S.u32,
     wid: S.u32,
@@ -291,7 +297,7 @@ def _input_fetch_scale_async(
         token_off = token_select_y * 4
     scale_block_pair = d // GROUP_DIM
     src_off = (wid // 2) * m * 4 + scale_block_pair * (m * 2 * 4)
-    lds_off = (SHM_SCALE_X_BASE + wid * WARP_SIZE) * 4
+    lds_off = (shm_scale_base + wid * WARP_SIZE) * 4
     S.amdgpu.raw_buffer_load_x1_lds(
         scales_rsrc,
         shared_words,
@@ -444,8 +450,6 @@ def _silu_dot(
 def _stage1(
     h: S.Tensor((8, 4), S.f32),
     shared_words: S.Tensor((SHM_TOTAL_DWORDS,), S.u32),
-    shm_x_u128: S.Tensor((INPUT_SHM_ELEMENTS // 4, 4), S.u32),
-    shm_scale_x: S.Tensor((THREADS,), S.f32),
     wid: S.u32,
     wtid: S.u32,
     tid: S.u32,
@@ -467,163 +471,126 @@ def _stage1(
 ):
     t_gate = S.make_local((8, 4), S.f32)
     t_up = S.make_local((8, 4), S.f32)
-    x = S.make_local((8, 4), S.u32)
+    x0 = S.make_local((8, 4), S.u32)
+    x1 = S.make_local((8, 4), S.u32)
     w1_stage0 = S.make_local((8, 4), S.u32)
     w1_stage1 = S.make_local((8, 4), S.u32)
     w3_stage0 = S.make_local((8, 4), S.u32)
     w3_stage1 = S.make_local((8, 4), S.u32)
-    scale_x = S.make_local((4,), S.f32)
+    scale_x0 = S.make_local((4,), S.f32)
+    scale_x1 = S.make_local((4,), S.f32)
     _clear_f32x4_matrix(t_gate)
     _clear_f32x4_matrix(t_up)
 
-    for d_step in S.range(dim // GROUP_DIM):
-        d = d_step * GROUP_DIM
-        _input_fetch_async(shared_words, act_rsrc, dim, d, wid, wtid, tokens)
+    shm_x0_words = S.subview(shared_words, (SHM_X0_BASE,), (INPUT_SHM_ELEMENTS,), (1,))
+    shm_x0_u128 = S.view(shm_x0_words, S.Tensor((INPUT_SHM_ELEMENTS // 4, 4), S.u32))
+    shm_scale_x0_words = S.subview(shared_words, (SHM_SCALE_X0_BASE,), (THREADS,), (1,))
+    shm_scale_x0 = S.view(shm_scale_x0_words, S.f32, S.make_layout((THREADS,), (1,)))
+    shm_x1_words = S.subview(shared_words, (SHM_X1_BASE,), (INPUT_SHM_ELEMENTS,), (1,))
+    shm_x1_u128 = S.view(shm_x1_words, S.Tensor((INPUT_SHM_ELEMENTS // 4, 4), S.u32))
+    shm_scale_x1_words = S.subview(shared_words, (SHM_SCALE_X1_BASE,), (THREADS,), (1,))
+    shm_scale_x1 = S.view(shm_scale_x1_words, S.f32, S.make_layout((THREADS,), (1,)))
+
+    w1_value_offset_bytes = w1_base_value_offset_bytes
+    w1_scale_offset_bytes = w1_base_scale_offset_bytes
+    w3_value_offset_bytes = w3_base_value_offset_bytes
+    w3_scale_offset_bytes = w3_base_scale_offset_bytes
+
+    _input_fetch_async(shared_words, act_rsrc, SHM_X0_BASE, dim, 0, wid, wtid, tokens)
+    _input_fetch_scale_async(
+        shared_words,
+        act_scale_rsrc,
+        SHM_SCALE_X0_BASE,
+        m,
+        0,
+        wid,
+        wtid,
+        token_select_x,
+        token_select_y,
+    )
+    _w13_load_tile_stage0(w1_stage0, w1_rsrc, w1_value_offset_bytes, dim, wid, wtid)
+    _w13_load_tile_stage1(w1_stage1, w1_rsrc, w1_value_offset_bytes, dim, wid, wtid)
+    scale_w1 = _w13_load_scale(w1_scale_rsrc, dim, tid, w1_scale_offset_bytes)
+    w1_value_offset_bytes = w1_value_offset_bytes + 4 * WARP_SIZE * 16
+    w1_scale_offset_bytes = w1_scale_offset_bytes + 8
+    S.amdgpu.s_waitcnt(0, -1, -1)
+    S.syncthreads()
+    _input_fetch_to_regs(x0, shm_x0_u128, wtid)
+    _input_fetch_scale_to_reg(scale_x0, shm_scale_x0, wtid)
+
+    stage1_iters = (dim + 2 * GROUP_DIM - 1) // (2 * GROUP_DIM)
+    for iter_idx in S.range(stage1_iters):
+        d = iter_idx * (2 * GROUP_DIM)
+        S.syncthreads()
+
+        _input_fetch_async(shared_words, act_rsrc, SHM_X1_BASE, dim, d + GROUP_DIM, wid, wtid, tokens)
         _input_fetch_scale_async(
             shared_words,
             act_scale_rsrc,
+            SHM_SCALE_X1_BASE,
             m,
-            d,
+            d + GROUP_DIM,
             wid,
             wtid,
             token_select_x,
             token_select_y,
         )
-        S.amdgpu.s_waitcnt(0, 7, 15)
-        S.syncthreads()
-
-        _input_fetch_to_regs(x, shm_x_u128, wtid)
-        _input_fetch_scale_to_reg(scale_x, shm_scale_x, wtid)
-        x_u2 = S.view(x, S.Tensor((16, 2), S.u32))
-
-        w1_value_offset_bytes = w1_base_value_offset_bytes + d_step * (4 * WARP_SIZE * 16)
-        w1_scale_offset_bytes = w1_base_scale_offset_bytes + d_step * 8
-        _w13_load_tile_stage0(w1_stage0, w1_rsrc, w1_value_offset_bytes, dim, wid, wtid)
-        _w13_load_tile_stage1(w1_stage1, w1_rsrc, w1_value_offset_bytes, dim, wid, wtid)
-        scale_w1 = _w13_load_scale(w1_scale_rsrc, dim, tid, w1_scale_offset_bytes)
-        w1_stage0_dpp = S.make_local((2,), S.f32)
-        w1_stage1_dpp = S.make_local((2,), S.f32)
-        w1_stage0_dpp[0] = S.amdgpu.get_dpp(scale_w1, scale_w1, ROW_NEW_BCAST_BASE + 0, 0xF, 0xF, 0)
-        w1_stage0_dpp[1] = S.amdgpu.get_dpp(scale_w1, scale_w1, ROW_NEW_BCAST_BASE + 1, 0xF, 0xF, 0)
-        w1_stage1_dpp[0] = S.amdgpu.get_dpp(scale_w1, scale_w1, ROW_NEW_BCAST_BASE + 2, 0xF, 0xF, 0)
-        w1_stage1_dpp[1] = S.amdgpu.get_dpp(scale_w1, scale_w1, ROW_NEW_BCAST_BASE + 3, 0xF, 0xF, 0)
-        w1_stage0_u2 = S.view(w1_stage0, S.Tensor((16, 2), S.u32))
-        w1_stage1_u2 = S.view(w1_stage1, S.Tensor((16, 2), S.u32))
-        for i in S.range(4):
-            w_base = i * 4
-            for row in S.range(2):
-                x_base = row * 8
-                acc = S.make_local((4,), S.f32)
-                for c in S.range(4):
-                    acc[c] = S.convert(0.0, S.f32)
-                for j in S.range(4):
-                    w_vec = S.view(w1_stage0_u2[w_base + j], S.Tensor((2,), S.u32))
-                    x_vec = S.view(x_u2[x_base + j], S.Tensor((2,), S.u32))
-                    acc = S.amdgpu.mfma_f32_16x16x32_fp8_fp8(w_vec, x_vec, acc)
-                s = w1_stage0_dpp[i >> 1] * scale_x[row]
-                scale_pair = S.make_local((2,), S.f32)
-                scale_pair[0] = s
-                scale_pair[1] = s
-                for pair in S.range(2):
-                    src_pair = S.make_local((2,), S.f32)
-                    dst_pair = S.make_local((2,), S.f32)
-                    for elem in S.range(2):
-                        src_pair[elem] = acc[pair * 2 + elem]
-                        dst_pair[elem] = t_gate[i * 2 + row, pair * 2 + elem]
-                    pair_val = S.make_local((2,), S.f32)
-                    for elem in S.range(2):
-                        pair_val[elem] = scale_pair[elem] * src_pair[elem] + dst_pair[elem]
-                        t_gate[i * 2 + row, pair * 2 + elem] = pair_val[elem]
-        for i in S.range(4):
-            w_base = i * 4
-            for row in S.range(2):
-                x_base = row * 8 + 4
-                acc = S.make_local((4,), S.f32)
-                for c in S.range(4):
-                    acc[c] = S.convert(0.0, S.f32)
-                for j in S.range(4):
-                    w_vec = S.view(w1_stage1_u2[w_base + j], S.Tensor((2,), S.u32))
-                    x_vec = S.view(x_u2[x_base + j], S.Tensor((2,), S.u32))
-                    acc = S.amdgpu.mfma_f32_16x16x32_fp8_fp8(w_vec, x_vec, acc)
-                s = w1_stage1_dpp[i >> 1] * scale_x[row + 2]
-                scale_pair = S.make_local((2,), S.f32)
-                scale_pair[0] = s
-                scale_pair[1] = s
-                for pair in S.range(2):
-                    src_pair = S.make_local((2,), S.f32)
-                    dst_pair = S.make_local((2,), S.f32)
-                    for elem in S.range(2):
-                        src_pair[elem] = acc[pair * 2 + elem]
-                        dst_pair[elem] = t_gate[i * 2 + row, pair * 2 + elem]
-                    pair_val = S.make_local((2,), S.f32)
-                    for elem in S.range(2):
-                        pair_val[elem] = scale_pair[elem] * src_pair[elem] + dst_pair[elem]
-                        t_gate[i * 2 + row, pair * 2 + elem] = pair_val[elem]
-
-        w3_value_offset_bytes = w3_base_value_offset_bytes + d_step * (4 * WARP_SIZE * 16)
-        w3_scale_offset_bytes = w3_base_scale_offset_bytes + d_step * 8
         _w13_load_tile_stage0(w3_stage0, w3_rsrc, w3_value_offset_bytes, dim, wid, wtid)
         _w13_load_tile_stage1(w3_stage1, w3_rsrc, w3_value_offset_bytes, dim, wid, wtid)
         scale_w3 = _w13_load_scale(w3_scale_rsrc, dim, tid, w3_scale_offset_bytes)
-        w3_stage0_dpp = S.make_local((2,), S.f32)
-        w3_stage1_dpp = S.make_local((2,), S.f32)
-        w3_stage0_dpp[0] = S.amdgpu.get_dpp(scale_w3, scale_w3, ROW_NEW_BCAST_BASE + 0, 0xF, 0xF, 0)
-        w3_stage0_dpp[1] = S.amdgpu.get_dpp(scale_w3, scale_w3, ROW_NEW_BCAST_BASE + 1, 0xF, 0xF, 0)
-        w3_stage1_dpp[0] = S.amdgpu.get_dpp(scale_w3, scale_w3, ROW_NEW_BCAST_BASE + 2, 0xF, 0xF, 0)
-        w3_stage1_dpp[1] = S.amdgpu.get_dpp(scale_w3, scale_w3, ROW_NEW_BCAST_BASE + 3, 0xF, 0xF, 0)
-        w3_stage0_u2 = S.view(w3_stage0, S.Tensor((16, 2), S.u32))
-        w3_stage1_u2 = S.view(w3_stage1, S.Tensor((16, 2), S.u32))
-        for i in S.range(4):
-            w_base = i * 4
-            for row in S.range(2):
-                x_base = row * 8
-                acc = S.make_local((4,), S.f32)
-                for c in S.range(4):
-                    acc[c] = S.convert(0.0, S.f32)
-                for j in S.range(4):
-                    w_vec = S.view(w3_stage0_u2[w_base + j], S.Tensor((2,), S.u32))
-                    x_vec = S.view(x_u2[x_base + j], S.Tensor((2,), S.u32))
-                    acc = S.amdgpu.mfma_f32_16x16x32_fp8_fp8(w_vec, x_vec, acc)
-                s = w3_stage0_dpp[i >> 1] * scale_x[row]
-                scale_pair = S.make_local((2,), S.f32)
-                scale_pair[0] = s
-                scale_pair[1] = s
-                for pair in S.range(2):
-                    src_pair = S.make_local((2,), S.f32)
-                    dst_pair = S.make_local((2,), S.f32)
-                    for elem in S.range(2):
-                        src_pair[elem] = acc[pair * 2 + elem]
-                        dst_pair[elem] = t_up[i * 2 + row, pair * 2 + elem]
-                    pair_val = S.make_local((2,), S.f32)
-                    for elem in S.range(2):
-                        pair_val[elem] = scale_pair[elem] * src_pair[elem] + dst_pair[elem]
-                        t_up[i * 2 + row, pair * 2 + elem] = pair_val[elem]
-        for i in S.range(4):
-            w_base = i * 4
-            for row in S.range(2):
-                x_base = row * 8 + 4
-                acc = S.make_local((4,), S.f32)
-                for c in S.range(4):
-                    acc[c] = S.convert(0.0, S.f32)
-                for j in S.range(4):
-                    w_vec = S.view(w3_stage1_u2[w_base + j], S.Tensor((2,), S.u32))
-                    x_vec = S.view(x_u2[x_base + j], S.Tensor((2,), S.u32))
-                    acc = S.amdgpu.mfma_f32_16x16x32_fp8_fp8(w_vec, x_vec, acc)
-                s = w3_stage1_dpp[i >> 1] * scale_x[row + 2]
-                scale_pair = S.make_local((2,), S.f32)
-                scale_pair[0] = s
-                scale_pair[1] = s
-                for pair in S.range(2):
-                    src_pair = S.make_local((2,), S.f32)
-                    dst_pair = S.make_local((2,), S.f32)
-                    for elem in S.range(2):
-                        src_pair[elem] = acc[pair * 2 + elem]
-                        dst_pair[elem] = t_up[i * 2 + row, pair * 2 + elem]
-                    pair_val = S.make_local((2,), S.f32)
-                    for elem in S.range(2):
-                        pair_val[elem] = scale_pair[elem] * src_pair[elem] + dst_pair[elem]
-                        t_up[i * 2 + row, pair * 2 + elem] = pair_val[elem]
+        w3_value_offset_bytes = w3_value_offset_bytes + 4 * WARP_SIZE * 16
+        w3_scale_offset_bytes = w3_scale_offset_bytes + 8
+        _matmul_stage0(t_gate, w1_stage0, x0, scale_x0, scale_w1)
+        _matmul_stage1(t_gate, w1_stage1, x0, scale_x0, scale_w1)
+        S.amdgpu.s_waitcnt(0, -1, -1)
+        _w13_load_tile_stage0(w1_stage0, w1_rsrc, w1_value_offset_bytes, dim, wid, wtid)
+        _w13_load_tile_stage1(w1_stage1, w1_rsrc, w1_value_offset_bytes, dim, wid, wtid)
+        scale_w1 = _w13_load_scale(w1_scale_rsrc, dim, tid, w1_scale_offset_bytes)
+        w1_value_offset_bytes = w1_value_offset_bytes + 4 * WARP_SIZE * 16
+        w1_scale_offset_bytes = w1_scale_offset_bytes + 8
+        _matmul_stage0(t_up, w3_stage0, x0, scale_x0, scale_w3)
+        _matmul_stage1(t_up, w3_stage1, x0, scale_x0, scale_w3)
+
+        if d + GROUP_DIM >= dim:
+            break
+
+        S.amdgpu.s_waitcnt(0, -1, -1)
         S.syncthreads()
+        _input_fetch_to_regs(x1, shm_x1_u128, wtid)
+        _input_fetch_scale_to_reg(scale_x1, shm_scale_x1, wtid)
+
+        _input_fetch_async(shared_words, act_rsrc, SHM_X0_BASE, dim, d + 2 * GROUP_DIM, wid, wtid, tokens)
+        _input_fetch_scale_async(
+            shared_words,
+            act_scale_rsrc,
+            SHM_SCALE_X0_BASE,
+            m,
+            d + 2 * GROUP_DIM,
+            wid,
+            wtid,
+            token_select_x,
+            token_select_y,
+        )
+        _w13_load_tile_stage0(w3_stage0, w3_rsrc, w3_value_offset_bytes, dim, wid, wtid)
+        _w13_load_tile_stage1(w3_stage1, w3_rsrc, w3_value_offset_bytes, dim, wid, wtid)
+        scale_w3 = _w13_load_scale(w3_scale_rsrc, dim, tid, w3_scale_offset_bytes)
+        w3_value_offset_bytes = w3_value_offset_bytes + 4 * WARP_SIZE * 16
+        w3_scale_offset_bytes = w3_scale_offset_bytes + 8
+        _matmul_stage0(t_gate, w1_stage0, x1, scale_x1, scale_w1)
+        _matmul_stage1(t_gate, w1_stage1, x1, scale_x1, scale_w1)
+        S.amdgpu.s_waitcnt(0, -1, -1)
+        _w13_load_tile_stage0(w1_stage0, w1_rsrc, w1_value_offset_bytes, dim, wid, wtid)
+        _w13_load_tile_stage1(w1_stage1, w1_rsrc, w1_value_offset_bytes, dim, wid, wtid)
+        scale_w1 = _w13_load_scale(w1_scale_rsrc, dim, tid, w1_scale_offset_bytes)
+        w1_value_offset_bytes = w1_value_offset_bytes + 4 * WARP_SIZE * 16
+        w1_scale_offset_bytes = w1_scale_offset_bytes + 8
+        _matmul_stage0(t_up, w3_stage0, x1, scale_x1, scale_w3)
+        _matmul_stage1(t_up, w3_stage1, x1, scale_x1, scale_w3)
+
+        S.amdgpu.s_waitcnt(0, -1, -1)
+        S.syncthreads()
+        _input_fetch_to_regs(x0, shm_x0_u128, wtid)
+        _input_fetch_scale_to_reg(scale_x0, shm_scale_x0, wtid)
 
     for i in S.range(8):
         tmp = S.make_local((4,), S.f32)
@@ -919,10 +886,6 @@ def _fused_moe_blockscale_fp8_kernel(
     _load_sorted_weights(sorted_weights, sorted_weights_ptr, num_valid_ids, tid, route_base)
 
     shared_words = S.make_shared((SHM_TOTAL_DWORDS,), S.u32)
-    shm_x_words = S.subview(shared_words, (SHM_X_BASE,), (INPUT_SHM_ELEMENTS,), (1,))
-    shm_x_u128 = S.view(shm_x_words, S.Tensor((INPUT_SHM_ELEMENTS // 4, 4), S.u32))
-    shm_scale_words = S.subview(shared_words, (SHM_SCALE_X_BASE,), (THREADS,), (1,))
-    shm_scale_x = S.view(shm_scale_words, S.f32, S.make_layout((THREADS,), (1,)))
     shm_max_words = S.subview(shared_words, (SHM_MAX_BASE,), (THREADS * 2,), (1,))
     shm_max = S.view(shm_max_words, S.f32, S.make_layout((THREADS, 2), (2, 1)))
     shm_q_h = S.subview(shared_words, (SHM_Q_H_BASE,), (THREADS * 8,), (1,))
@@ -947,8 +910,6 @@ def _fused_moe_blockscale_fp8_kernel(
     _stage1(
         h,
         shared_words,
-        shm_x_u128,
-        shm_scale_x,
         wid,
         wtid,
         tid,
