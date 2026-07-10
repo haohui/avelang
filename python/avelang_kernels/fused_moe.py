@@ -763,6 +763,7 @@ def _stage2_read_shm(
 def _stage2_write_back(
     out_bf16: S.Tensor((2,), S.bf16),
     packed: S.Tensor((8, 2), S.u32),
+    invalid_token_mask: S.u32,
     tokens: S.Tensor((TOKEN_BATCH,), S.u32),
     num_tokens: S.u32,
     dim: S.u32,
@@ -770,21 +771,19 @@ def _stage2_write_back(
     wid: S.u32,
     wtid: S.u32,
 ):
+    zero = S.convert(0, S.u32)
     for i in S.range(8):
-        if tokens[i] < num_tokens:
-            voffset_bytes = (tokens[i] * dim + d + wtid * 2) * 2
-            o0_words = S.make_local((1,), S.u32)
-            o1_words = S.make_local((1,), S.u32)
-            o0_words[0] = packed[i, 0]
-            o1_words[0] = packed[i, 1]
-            o0_bf16 = S.view(o0_words, S.Tensor((1, 2), S.bf16))[0]
-            o1_bf16 = S.view(o1_words, S.Tensor((1, 2), S.bf16))[0]
-            S.amdgpu.atomic_add(
-                voffset_bytes, o0_bf16, out_bf16, 1
-            )
-            S.amdgpu.atomic_add(
-                voffset_bytes + 256, o1_bf16, out_bf16, 1
-            )
+        voffset_bytes = (tokens[i] * dim + d + wtid * 2) * 2
+        o0_words = S.make_local((1,), S.u32)
+        o1_words = S.make_local((1,), S.u32)
+        o0_words[0] = packed[i, 0]
+        o1_words[0] = packed[i, 1]
+        o0_bf16 = S.view(o0_words, S.Tensor((1, 2), S.bf16))[0]
+        o1_bf16 = S.view(o1_words, S.Tensor((1, 2), S.bf16))[0]
+        S.amdgpu.v_setvskip(invalid_token_mask, S.convert(i, S.u32))
+        S.amdgpu.atomic_add(voffset_bytes, o0_bf16, out_bf16, 1)
+        S.amdgpu.atomic_add(voffset_bytes + 256, o1_bf16, out_bf16, 1)
+        S.amdgpu.v_setvskip(zero, zero)
 
 
 @avelang.jit
@@ -795,6 +794,7 @@ def _stage2(
     quant_h: S.Tensor((8, 4), S.u32),
     dq_act: S.Tensor((4,), S.f32),
     sorted_weights: S.Tensor((2,), S.f32),
+    invalid_token_mask: S.u32,
     tokens: S.Tensor((TOKEN_BATCH,), S.u32),
     num_tokens: S.u32,
     tid: S.u32,
@@ -871,7 +871,17 @@ def _stage2(
                 _stage2_write_shm(shm_ret1, packed, wid, wtid)
 
             if tile_d != 0:
-                _stage2_write_back(out_bf16, ret, tokens, num_tokens, dim, tile_d - GROUP_N, wid, wtid)
+                _stage2_write_back(
+                    out_bf16,
+                    ret,
+                    invalid_token_mask,
+                    tokens,
+                    num_tokens,
+                    dim,
+                    tile_d - GROUP_N,
+                    wid,
+                    wtid,
+                )
             S.syncthreads()
 
     S.syncthreads()
@@ -881,7 +891,17 @@ def _stage2(
         _stage2_read_shm(ret, shm_ret0, wid, wtid)
     else:
         _stage2_read_shm(ret, shm_ret1, wid, wtid)
-    _stage2_write_back(out_bf16, ret, tokens, num_tokens, dim, dim - GROUP_N, wid, wtid)
+    _stage2_write_back(
+        out_bf16,
+        ret,
+        invalid_token_mask,
+        tokens,
+        num_tokens,
+        dim,
+        dim - GROUP_N,
+        wid,
+        wtid,
+    )
 
 
 @avelang.jit
@@ -951,6 +971,11 @@ def _fused_moe_blockscale_fp8_kernel(
         token_idx = wid + i * 4
         tokens[i] = g_sorted_token_ids[route_base + token_idx] & 0x00FFFFFF
 
+    invalid_token_mask = S.convert(0, S.u32)
+    for i in S.range(TOKEN_BATCH):
+        if tokens[i] >= num_tokens:
+            invalid_token_mask = invalid_token_mask | (S.convert(1, S.u32) << i)
+
     sorted_weights = S.make_local((2,), S.f32)
     _load_sorted_weights(sorted_weights, sorted_weights_ptr, num_valid_ids, tid, route_base)
 
@@ -1012,6 +1037,7 @@ def _fused_moe_blockscale_fp8_kernel(
         quant_h,
         dq_act,
         sorted_weights,
+        invalid_token_mask,
         tokens,
         num_tokens,
         tid,
