@@ -203,6 +203,46 @@ CreateUnaryFloatMathFunction(ast::Call *call_expr, GeneratorContext *ctx,
         .getResult();
 }
 
+static mlir::Value
+CreateFmaOperation(ast::Call *call_expr, GeneratorContext *ctx,
+                   llvm::ArrayRef<mlir::Value> resolved_args) {
+    if (call_expr->GetArgs().size() != 3 || resolved_args.size() != 3 ||
+        !resolved_args[0] || !resolved_args[1] || !resolved_args[2]) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "avelang.fma() expects exactly 3 arguments";
+        return nullptr;
+    }
+
+    auto type = resolved_args[0].getType();
+    if (resolved_args[1].getType() != type ||
+        resolved_args[2].getType() != type) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "avelang.fma() expects arguments with matching types";
+        return nullptr;
+    }
+
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = GetCallLocation(ctx, call_expr);
+    if (mlir::isa<mlir::FloatType>(type)) {
+        return mlir::math::FmaOp::create(builder, location, resolved_args[0],
+                                         resolved_args[1], resolved_args[2])
+            .getResult();
+    }
+    if (auto vectorType = mlir::dyn_cast<mlir::VectorType>(type);
+        vectorType && mlir::isa<mlir::FloatType>(vectorType.getElementType())) {
+        return mlir::vector::FMAOp::create(builder, location, resolved_args[0],
+                                            resolved_args[1], resolved_args[2])
+            .getResult();
+    }
+
+    ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                    call_expr->GetSourceRange().getBegin())
+        << "avelang.fma() expects floating-point scalar or vector arguments";
+    return nullptr;
+}
+
 // Helper function for GPU functions that require dimension argument processing
 template <typename OpType>
 static mlir::Value
@@ -499,6 +539,13 @@ void AveLangModule::Initialize() {
         [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
                llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
             return CreateBitcastFunction(call_expr, gen_ctx, resolved_args);
+        });
+
+    AddFunction(
+        "fma",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateFmaFunction(call_expr, gen_ctx, resolved_args);
         });
 
     AddFunction(
@@ -928,6 +975,12 @@ mlir::Value AveLangModule::CreateBitcastFunction(
         SetTypeInfo(bitcast.getResult(), targetTypeInfo);
     }
     return bitcast.getResult();
+}
+
+mlir::Value AveLangModule::CreateFmaFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    return CreateFmaOperation(call_expr, ctx, resolved_args);
 }
 
 mlir::Value AveLangModule::CreateAbsFunction(

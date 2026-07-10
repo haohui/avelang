@@ -29,6 +29,9 @@ class AveLangModule : public NamedModule {
     CreateBitcastFunction(ast::Call *call_expr, GeneratorContext *ctx,
                           llvm::ArrayRef<mlir::Value> resolved_args) const;
     mlir::Value
+    CreateFmaFunction(ast::Call *call_expr, GeneratorContext *ctx,
+                      llvm::ArrayRef<mlir::Value> resolved_args) const;
+    mlir::Value
     CreateAbsFunction(ast::Call *call_expr, GeneratorContext *ctx,
                       llvm::ArrayRef<mlir::Value> resolved_args) const;
     mlir::Value

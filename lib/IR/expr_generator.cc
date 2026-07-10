@@ -708,7 +708,11 @@ mlir::Value ExprGenerator::VisitBinOp(ast::BinOp *binop) {
             SetTypeInfo(result, TypeInfo{isUnsigned});
             return result;
         }
-    } else if (mlir::isa<mlir::FloatType>(result_type)) {
+    }
+    auto vector_type = mlir::dyn_cast<mlir::VectorType>(result_type);
+    if (mlir::isa<mlir::FloatType>(result_type) ||
+        (vector_type &&
+         mlir::isa<mlir::FloatType>(vector_type.getElementType()))) {
         if (floatOpIt != kFloatOps.end()) {
             return floatOpIt->second(builder, location, converted_lhs,
                                      converted_rhs);

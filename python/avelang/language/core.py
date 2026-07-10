@@ -133,6 +133,11 @@ def max(lhs, rhs):
     pass
 
 
+def fma(a, b, c):
+    """Compute the fused multiply-add a * b + c."""
+    pass
+
+
 def abs(x):
     """Compute |x| for scalar GPU floating-point values."""
     pass
