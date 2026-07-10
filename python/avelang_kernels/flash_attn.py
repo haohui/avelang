@@ -24,14 +24,14 @@ SHM_Q_WORDS = BLOCK_ROWS * HEAD_DIM // 2
 SHM_K_WORDS = BLOCK_COLS * HEAD_DIM // 2
 Q_STAGE_ROWS = BLOCK_ROWS // K_SLICES
 Q_STAGE_DATA_WORDS = Q_STAGE_ROWS * HEAD_DIM // 2
-Q_STAGE_PADDING_U32 = 0
+Q_STAGE_PADDING_U32 = (Q_STAGE_ROWS * HEAD_DIM) // (WARP_SIZE * 2) * (U128_BYTES // U32_BYTES)
 SHM_Q_STAGE_WORDS = Q_STAGE_DATA_WORDS + Q_STAGE_PADDING_U32
 K_SLICE_ROWS = BLOCK_COLS // K_SLICES
 K_SLICE_DATA_WORDS = K_SLICE_ROWS * HEAD_DIM // 2
-K_SLICE_PADDING_U32 = 0
+K_SLICE_PADDING_U32 = (K_SLICE_ROWS * HEAD_DIM) // (WARP_SIZE * 2) * (U128_BYTES // U32_BYTES)
 K_PAGE_WORDS = K_SLICE_DATA_WORDS + K_SLICE_PADDING_U32
 V_COLS_U32 = HEAD_DIM // 2
-V_PADDING_U32 = 0
+V_PADDING_U32 = 1
 V_LOGICAL_ROW_STRIDE_U32 = V_COLS_U32
 V_ROW_GROUPS = BLOCK_COLS // 4
 V_SLICE_ROW_GROUPS = K_SLICE_ROWS // 4
@@ -60,7 +60,7 @@ HALF_WARP_ROWS = 16
 SCORE_TILE_COLS = 16
 QK_TILE_DWORDS = SCORE_TILE_COLS // 2
 QK_ROW_DATA_WORDS = HEAD_DIM // 2
-QK_ROW_PADDING_WORDS = 0
+QK_ROW_PADDING_WORDS = U128_BYTES // U32_BYTES
 QK_ROW_STRIDE_WORDS = QK_ROW_DATA_WORDS + QK_ROW_PADDING_WORDS
 QK_TILE_ROW_STRIDE_WORDS = WARP_ROWS * QK_ROW_STRIDE_WORDS
 Q_BATCHES = HEAD_DIM // SCORE_TILE_COLS
@@ -754,6 +754,94 @@ def _flash_attn_update_o_batch1(
 
 
 @avelang.jit
+def _flash_attn_prepare_o_batch0(
+    score_acc: al.Tensor((K_BATCHES, 16), al.f32),
+    out_acc: al.Tensor((O_BATCHES, 16), al.f32),
+    softmax_state: al.Tensor((2,), al.f32),
+    partition_idx: al.u32,
+    lane_half: al.u32,
+    wtid: al.u32,
+    scale_log2: al.f32,
+) -> (al.f32, al.f32):
+    zero_f32 = al.convert(0.0, al.f32)
+    mi = softmax_state[0]
+    l = softmax_state[1]
+    block_max = _compute_row_max_batch0(score_acc, wtid)
+    mi_new = block_max
+    if partition_idx != 0:
+        if (block_max - mi) * scale_log2 <= al.convert(8.0, al.f32):
+            mi_new = mi
+        elif mi > block_max:
+            mi_new = mi
+    if block_max <= al.convert(NEG_INF, al.f32):
+        if partition_idx == 0:
+            mi_new = zero_f32
+        else:
+            mi_new = mi
+
+    local_sum = _compute_ptilde_and_row_sum_batch0(score_acc, mi_new, scale_log2)
+    row_sum = local_sum
+    if partition_idx == 0:
+        l = row_sum
+    else:
+        if (block_max - mi) * scale_log2 <= al.convert(8.0, al.f32):
+            l = l + row_sum
+        else:
+            scaling = al.exp2((mi - mi_new) * scale_log2)
+            l = al.fma(scaling, l, row_sum)
+            _multiply_alpha_o_mfma(scaling, out_acc)
+    mi = mi_new
+
+    softmax_state[0] = mi
+    softmax_state[1] = l
+    return mi, l
+
+
+@avelang.jit
+def _flash_attn_prepare_o_batch1(
+    score_acc: al.Tensor((K_BATCHES, 16), al.f32),
+    out_acc: al.Tensor((O_BATCHES, 16), al.f32),
+    softmax_state: al.Tensor((2,), al.f32),
+    partition_idx: al.u32,
+    lane_half: al.u32,
+    wtid: al.u32,
+    scale_log2: al.f32,
+) -> (al.f32, al.f32):
+    zero_f32 = al.convert(0.0, al.f32)
+    mi = softmax_state[0]
+    l = softmax_state[1]
+    block_max = _compute_row_max_batch1(score_acc, wtid)
+    mi_new = block_max
+    if partition_idx != 0:
+        if (block_max - mi) * scale_log2 <= al.convert(8.0, al.f32):
+            mi_new = mi
+        elif mi > block_max:
+            mi_new = mi
+    if block_max <= al.convert(NEG_INF, al.f32):
+        if partition_idx == 0:
+            mi_new = zero_f32
+        else:
+            mi_new = mi
+
+    local_sum = _compute_ptilde_and_row_sum_batch1(score_acc, mi_new, scale_log2)
+    row_sum = local_sum
+    if partition_idx == 0:
+        l = row_sum
+    else:
+        if (block_max - mi) * scale_log2 <= al.convert(8.0, al.f32):
+            l = l + row_sum
+        else:
+            scaling = al.exp2((mi - mi_new) * scale_log2)
+            l = al.fma(scaling, l, row_sum)
+            _multiply_alpha_o_mfma(scaling, out_acc)
+    mi = mi_new
+
+    softmax_state[0] = mi
+    softmax_state[1] = l
+    return mi, l
+
+
+@avelang.jit
 def _flash_attn_compute_qk_page(
     k_stage_words: al.Tensor((SHM_V_OFFSET_WORDS,), al.u32),
     k_rsrc: al.Tensor((4,), al.u32),
@@ -800,6 +888,324 @@ def _flash_attn_compute_qk_page(
                 actual_key_base,
                 lane_half,
             )
+
+
+@avelang.jit
+def _flash_attn_compute_qk_page_loaded(
+    k_stage_words: al.Tensor((SHM_V_OFFSET_WORDS,), al.u32),
+    q_regs: al.Tensor((Q_BATCHES, 2, 2), al.u32),
+    score_acc: al.Tensor((K_BATCHES, 16), al.f32),
+    key_row_local: al.u32,
+    lane_half: al.u32,
+    global_query_row: al.u32,
+    seq_len: al.u32,
+    actual_key_base: al.u32,
+    first_causal_key_base: al.u32,
+    page: al.u32,
+):
+    k_regs = al.make_local((Q_BATCHES, 2, 2), al.u32)
+    _fetch_k_reg_words_page_small(k_regs, k_stage_words, key_row_local, lane_half, page)
+    if page == 0:
+        _gemm_qk_word_regs_batch0_small(score_acc, q_regs, k_regs)
+    else:
+        _gemm_qk_word_regs_batch1_small(score_acc, q_regs, k_regs)
+    if actual_key_base >= first_causal_key_base:
+        if page == 0:
+            _apply_lower_causal_mask_batch0_at_key_base(
+                score_acc,
+                global_query_row,
+                actual_key_base,
+                lane_half,
+            )
+        else:
+            _apply_lower_causal_mask_batch1_at_key_base(
+                score_acc,
+                global_query_row,
+                actual_key_base,
+                lane_half,
+            )
+
+
+@avelang.jit
+def _flash_attn_packed_pair_step_wg0(
+    k_stage_words: al.Tensor((SHM_V_OFFSET_WORDS,), al.u32),
+    work_words: al.Tensor((SHM_WORK_WORDS,), al.u32),
+    v_words: al.Tensor((SHM_V_WORDS,), al.u32),
+    k_rsrc: al.Tensor((4,), al.u32),
+    v_rsrc: al.Tensor((4,), al.u32),
+    q_regs: al.Tensor((Q_BATCHES, 2, 2), al.u32),
+    v_regs: al.Tensor((O_BATCHES, 4, 2), al.u32),
+    g_v0: al.Tensor((4,), al.u32),
+    g_v1: al.Tensor((4,), al.u32),
+    score_acc: al.Tensor((K_BATCHES, 16), al.f32),
+    out_acc: al.Tensor((O_BATCHES, 16), al.f32),
+    softmax_state: al.Tensor((2,), al.f32),
+    tid: al.u32,
+    wid: al.u32,
+    wtid: al.u32,
+    key_row_local: al.u32,
+    lane_half: al.u32,
+    global_query_row: al.u32,
+    seq_len: al.u32,
+    pair_idx: al.u32,
+    max_k_slice: al.u32,
+    actual_odd_key_base: al.u32,
+    actual_next_even_key_base: al.u32,
+    first_causal_key_base: al.u32,
+    kv_row_stride_words: al.u32,
+    scale_log2: al.f32,
+):
+    odd_slice = pair_idx * 2 + 1
+    next_even_slice = odd_slice + 1
+
+    _flash_attn_compute_qk_page_loaded(
+        k_stage_words,
+        q_regs,
+        score_acc,
+        key_row_local,
+        lane_half,
+        global_query_row,
+        seq_len,
+        actual_odd_key_base,
+        first_causal_key_base,
+        1,
+    )
+    al.syncthreads()
+    _fetch_v_global_slice_packed_strided(
+        g_v1,
+        v_rsrc,
+        wid,
+        wtid,
+        actual_odd_key_base,
+        kv_row_stride_words,
+        0,
+    )
+    al.syncthreads()
+
+    al.amdgpu.s_waitcnt(0, 7, 15)
+    _store_v_global_slice_packed(work_words, g_v0, wid, wtid, 0)
+    al.syncthreads()
+    _fetch_v_reg_words_batch_compact(v_regs, v_words, key_row_local, wtid, 0)
+    _flash_attn_update_o_batch0(
+        score_acc,
+        out_acc,
+        v_regs,
+        softmax_state,
+        pair_idx * 2,
+        lane_half,
+        wtid,
+        scale_log2,
+    )
+    al.syncthreads()
+
+    if next_even_slice <= max_k_slice:
+        al.amdgpu.s_waitcnt(0, 7, 15)
+        al.syncthreads()
+        _flash_attn_compute_qk_page_loaded(
+            k_stage_words,
+            q_regs,
+            score_acc,
+            key_row_local,
+            lane_half,
+            global_query_row,
+            seq_len,
+            actual_next_even_key_base,
+            first_causal_key_base,
+            0,
+        )
+        al.syncthreads()
+        _fetch_v_global_slice_packed_strided(
+            g_v0,
+            v_rsrc,
+            wid,
+            wtid,
+            actual_next_even_key_base,
+            kv_row_stride_words,
+            0,
+        )
+        al.syncthreads()
+        al.amdgpu.s_waitcnt(0, 7, 15)
+        _store_v_global_slice_packed(work_words, g_v1, wid, wtid, 1)
+        al.syncthreads()
+        _fetch_v_reg_words_batch_compact(v_regs, v_words, key_row_local, wtid, 1)
+        _flash_attn_update_o_batch1(
+            score_acc,
+            out_acc,
+            v_regs,
+            softmax_state,
+            odd_slice,
+            lane_half,
+            wtid,
+            scale_log2,
+        )
+        al.syncthreads()
+
+
+@avelang.jit
+def _flash_attn_packed_pair_step_wg1(
+    k_stage_words: al.Tensor((SHM_V_OFFSET_WORDS,), al.u32),
+    work_words: al.Tensor((SHM_WORK_WORDS,), al.u32),
+    v_words: al.Tensor((SHM_V_WORDS,), al.u32),
+    k_rsrc: al.Tensor((4,), al.u32),
+    v_rsrc: al.Tensor((4,), al.u32),
+    q_regs: al.Tensor((Q_BATCHES, 2, 2), al.u32),
+    v_regs: al.Tensor((O_BATCHES, 4, 2), al.u32),
+    g_v0: al.Tensor((4,), al.u32),
+    g_v1: al.Tensor((4,), al.u32),
+    score_acc: al.Tensor((K_BATCHES, 16), al.f32),
+    out_acc: al.Tensor((O_BATCHES, 16), al.f32),
+    softmax_state: al.Tensor((2,), al.f32),
+    tid: al.u32,
+    wid: al.u32,
+    wtid: al.u32,
+    key_row_local: al.u32,
+    lane_half: al.u32,
+    global_query_row: al.u32,
+    seq_len: al.u32,
+    pair_idx: al.u32,
+    max_k_slice: al.u32,
+    actual_odd_key_base: al.u32,
+    actual_next_even_key_base: al.u32,
+    first_causal_key_base: al.u32,
+    kv_row_stride_words: al.u32,
+    scale_log2: al.f32,
+):
+    odd_slice = pair_idx * 2 + 1
+    next_even_slice = odd_slice + 1
+
+    _fetch_v_global_slice_packed_strided(
+        g_v1,
+        v_rsrc,
+        wid,
+        wtid,
+        actual_odd_key_base,
+        kv_row_stride_words,
+        0,
+    )
+    al.syncthreads()
+    _flash_attn_compute_qk_page_loaded(
+        k_stage_words,
+        q_regs,
+        score_acc,
+        key_row_local,
+        lane_half,
+        global_query_row,
+        seq_len,
+        actual_odd_key_base,
+        first_causal_key_base,
+        1,
+    )
+    al.syncthreads()
+
+    al.amdgpu.s_waitcnt(0, 7, 15)
+    _store_v_global_slice_packed(work_words, g_v0, wid, wtid, 0)
+    al.syncthreads()
+    _fetch_v_reg_words_batch_compact(v_regs, v_words, key_row_local, wtid, 0)
+    _flash_attn_update_o_batch0(
+        score_acc,
+        out_acc,
+        v_regs,
+        softmax_state,
+        pair_idx * 2,
+        lane_half,
+        wtid,
+        scale_log2,
+    )
+    al.syncthreads()
+
+    if next_even_slice <= max_k_slice:
+        _fetch_v_global_slice_packed_strided(
+            g_v0,
+            v_rsrc,
+            wid,
+            wtid,
+            actual_next_even_key_base,
+            kv_row_stride_words,
+            0,
+        )
+        al.syncthreads()
+        al.amdgpu.s_waitcnt(0, 7, 15)
+        al.syncthreads()
+        _flash_attn_compute_qk_page_loaded(
+            k_stage_words,
+            q_regs,
+            score_acc,
+            key_row_local,
+            lane_half,
+            global_query_row,
+            seq_len,
+            actual_next_even_key_base,
+            first_causal_key_base,
+            0,
+        )
+        al.syncthreads()
+        al.amdgpu.s_waitcnt(0, 7, 15)
+        _store_v_global_slice_packed(work_words, g_v1, wid, wtid, 1)
+        al.syncthreads()
+        _fetch_v_reg_words_batch_compact(v_regs, v_words, key_row_local, wtid, 1)
+        _flash_attn_update_o_batch1(
+            score_acc,
+            out_acc,
+            v_regs,
+            softmax_state,
+            odd_slice,
+            lane_half,
+            wtid,
+            scale_log2,
+        )
+        al.syncthreads()
+
+
+@avelang.jit
+def _flash_attn_packed_drain_epilogue(
+    work_words: al.Tensor((SHM_WORK_WORDS,), al.u32),
+    v_words: al.Tensor((SHM_V_WORDS,), al.u32),
+    score_acc: al.Tensor((K_BATCHES, 16), al.f32),
+    out_acc: al.Tensor((O_BATCHES, 16), al.f32),
+    v_regs: al.Tensor((O_BATCHES, 4, 2), al.u32),
+    g_v0: al.Tensor((4,), al.u32),
+    g_v1: al.Tensor((4,), al.u32),
+    softmax_state: al.Tensor((2,), al.f32),
+    wid: al.u32,
+    wtid: al.u32,
+    key_row_local: al.u32,
+    lane_half: al.u32,
+    max_k_slice: al.u32,
+    scale_log2: al.f32,
+):
+    epilogue_uses_s1 = (max_k_slice & 1) != 0
+    if epilogue_uses_s1:
+        _flash_attn_prepare_o_batch1(
+            score_acc,
+            out_acc,
+            softmax_state,
+            max_k_slice,
+            lane_half,
+            wtid,
+            scale_log2,
+        )
+    else:
+        _flash_attn_prepare_o_batch0(
+            score_acc,
+            out_acc,
+            softmax_state,
+            max_k_slice,
+            lane_half,
+            wtid,
+            scale_log2,
+        )
+    if epilogue_uses_s1:
+        al.amdgpu.s_waitcnt(0, 7, 15)
+        _store_v_global_slice_packed(work_words, g_v1, wid, wtid, 1)
+        al.syncthreads()
+        _fetch_v_reg_words_batch_compact(v_regs, v_words, key_row_local, wtid, 1)
+        _gemm_o_mfma_v_word_regs_batch1_direct(out_acc, score_acc, v_regs)
+    if not epilogue_uses_s1:
+        al.amdgpu.s_waitcnt(0, 7, 15)
+        _store_v_global_slice_packed(work_words, g_v0, wid, wtid, 0)
+        al.syncthreads()
+        _fetch_v_reg_words_batch_compact(v_regs, v_words, key_row_local, wtid, 0)
+        _gemm_o_mfma_v_word_regs_batch0_direct(out_acc, score_acc, v_regs)
 
 
 @avelang.jit
@@ -1032,33 +1438,195 @@ def _flash_attn_packed_process_tile(
     if seq_last_row < tile_last_row:
         last_query_row = seq_last_row
     max_k_slice = last_query_row // K_SLICE_ROWS
+    pair_count = (max_k_slice + 1) // 2
+    first_slice = _actual_k_slice_from_ordinal(max_k_slice, 0, reverse_pass)
+    second_slice = _actual_k_slice_from_ordinal(max_k_slice, 1, reverse_pass)
+    first_key_base = first_slice * K_SLICE_ROWS
+    second_key_base = second_slice * K_SLICE_ROWS
     first_causal_key_base = q_base
 
-    _flash_attn_serial_k_loop(
+    _flash_attn_compute_qk_page(
         k_stage_words,
-        kv_words,
-        v_words,
         k_rsrc,
-        v_rsrc,
         q_regs,
-        v_regs,
-        g_v0,
-        g_v1,
         score_acc,
-        out_acc,
-        softmax_state,
         tid,
-        wid,
-        wtid,
         key_row_local,
         lane_half,
         global_query_row,
         seq_len,
-        max_k_slice,
+        first_key_base,
         first_causal_key_base,
         kv_row_stride_words,
+        0,
+    )
+    _fetch_v_global_slice_packed_strided(
+        g_v0,
+        v_rsrc,
+        wid,
+        wtid,
+        first_key_base,
+        kv_row_stride_words,
+        0,
+    )
+    _load_k_page_strided(
+        k_stage_words,
+        k_rsrc,
+        tid,
+        second_key_base,
+        kv_row_stride_words,
+        1,
+    )
+    _load_k_page_strided(
+        k_stage_words,
+        k_rsrc,
+        tid,
+        first_key_base,
+        kv_row_stride_words,
+        0,
+    )
+    al.amdgpu.s_waitcnt(0, 7, 15)
+    al.syncthreads()
+    if wid < (NUM_WARPS // 2):
+        _fetch_v_global_slice_packed_strided(
+            g_v1,
+            v_rsrc,
+            wid,
+            wtid,
+            second_key_base,
+            kv_row_stride_words,
+            0,
+        )
+
+    if wid < (NUM_WARPS // 2):
+        for pair_idx in al.range(pair_count):
+            odd_slice_pre = pair_idx * 2 + 1
+            actual_odd_slice = _actual_k_slice_from_ordinal(max_k_slice, odd_slice_pre, reverse_pass)
+            actual_odd_key_base = actual_odd_slice * K_SLICE_ROWS
+            if pair_idx != 0:
+                if odd_slice_pre <= max_k_slice:
+                    _load_k_page_strided(
+                        k_stage_words,
+                        k_rsrc,
+                        tid,
+                        actual_odd_key_base,
+                        kv_row_stride_words,
+                        1,
+                    )
+                    al.amdgpu.s_waitcnt(0, 7, 15)
+                    al.syncthreads()
+            next_even_slice_pre = pair_idx * 2 + 2
+            actual_next_even_slice = _actual_k_slice_from_ordinal(max_k_slice, next_even_slice_pre, reverse_pass)
+            actual_next_even_key_base = actual_next_even_slice * K_SLICE_ROWS
+            if next_even_slice_pre <= max_k_slice:
+                _load_k_page_strided(
+                    k_stage_words,
+                    k_rsrc,
+                    tid,
+                    actual_next_even_key_base,
+                    kv_row_stride_words,
+                    0,
+                )
+            _flash_attn_packed_pair_step_wg0(
+                k_stage_words,
+                kv_words,
+                v_words,
+                k_rsrc,
+                v_rsrc,
+                q_regs,
+                v_regs,
+                g_v0,
+                g_v1,
+                score_acc,
+                out_acc,
+                softmax_state,
+                tid,
+                wid,
+                wtid,
+                key_row_local,
+                lane_half,
+                global_query_row,
+                seq_len,
+                pair_idx,
+                max_k_slice,
+                actual_odd_key_base,
+                actual_next_even_key_base,
+                first_causal_key_base,
+                kv_row_stride_words,
+                scale_log2,
+            )
+    else:
+        for pair_idx in al.range(pair_count):
+            odd_slice_pre = pair_idx * 2 + 1
+            actual_odd_slice = _actual_k_slice_from_ordinal(max_k_slice, odd_slice_pre, reverse_pass)
+            actual_odd_key_base = actual_odd_slice * K_SLICE_ROWS
+            if pair_idx != 0:
+                if odd_slice_pre <= max_k_slice:
+                    _load_k_page_strided(
+                        k_stage_words,
+                        k_rsrc,
+                        tid,
+                        actual_odd_key_base,
+                        kv_row_stride_words,
+                        1,
+                    )
+                    al.amdgpu.s_waitcnt(0, 7, 15)
+                    al.syncthreads()
+            next_even_slice_pre = pair_idx * 2 + 2
+            actual_next_even_slice = _actual_k_slice_from_ordinal(max_k_slice, next_even_slice_pre, reverse_pass)
+            actual_next_even_key_base = actual_next_even_slice * K_SLICE_ROWS
+            if next_even_slice_pre <= max_k_slice:
+                _load_k_page_strided(
+                    k_stage_words,
+                    k_rsrc,
+                    tid,
+                    actual_next_even_key_base,
+                    kv_row_stride_words,
+                    0,
+                )
+            _flash_attn_packed_pair_step_wg1(
+                k_stage_words,
+                kv_words,
+                v_words,
+                k_rsrc,
+                v_rsrc,
+                q_regs,
+                v_regs,
+                g_v0,
+                g_v1,
+                score_acc,
+                out_acc,
+                softmax_state,
+                tid,
+                wid,
+                wtid,
+                key_row_local,
+                lane_half,
+                global_query_row,
+                seq_len,
+                pair_idx,
+                max_k_slice,
+                actual_odd_key_base,
+                actual_next_even_key_base,
+                first_causal_key_base,
+                kv_row_stride_words,
+                scale_log2,
+            )
+    _flash_attn_packed_drain_epilogue(
+        kv_words,
+        v_words,
+        score_acc,
+        out_acc,
+        v_regs,
+        g_v0,
+        g_v1,
+        softmax_state,
+        wid,
+        wtid,
+        key_row_local,
+        lane_half,
+        max_k_slice,
         scale_log2,
-        reverse_pass,
     )
 
     out_elems = total_tokens * Q_HEADS * HEAD_DIM
@@ -1145,6 +1713,7 @@ def _flash_attn_packed_kernel(
     merged_head_tile = (physical_q_head_idx & 7) * physical_tiles + physical_q_tile_idx
     q_head_idx = (physical_q_head_idx // 8) * 8 + (merged_head_tile & 7)
     head_idx_q = merged_head_tile >> 3
+
     kv_head_idx = q_head_idx // (Q_HEADS // KV_HEADS)
     q_row_stride_elems = Q_HEADS * HEAD_DIM
     kv_row_stride_elems = KV_HEADS * HEAD_DIM
@@ -1165,6 +1734,7 @@ def _flash_attn_packed_kernel(
     num_passes = 1
     if mirrored_idx_q != head_idx_q:
         num_passes = 2
+
     tile_idx = head_idx_q
     reverse_pass = 0
     for _ in al.range(num_passes):
