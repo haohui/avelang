@@ -233,7 +233,11 @@ def _build_replay_like_case() -> dict[str, torch.Tensor | int]:
     }
 
 
-def _run(case: dict[str, torch.Tensor | int], out: torch.Tensor | None = None) -> torch.Tensor:
+def _run(
+    case: dict[str, torch.Tensor | int],
+    out: torch.Tensor | None = None,
+    num_persistent_tgs: int = 0,
+) -> torch.Tensor:
     w13_kernel = case.get("w13_kernel")
     w2_kernel = case.get("w2_kernel")
     if w13_kernel is None:
@@ -252,6 +256,7 @@ def _run(case: dict[str, torch.Tensor | int], out: torch.Tensor | None = None) -
         case["input_scale"],  # type: ignore[arg-type]
         case["fc1_scale"],  # type: ignore[arg-type]
         case["fc2_scale"],  # type: ignore[arg-type]
+        num_persistent_tgs=num_persistent_tgs,
         out=out,
     )
 
@@ -278,6 +283,18 @@ def test_fused_moe_blockscale_fp8_harsh_scale_matches_reference():
     torch.manual_seed(7)
     case = _build_case(tokens=32, dim=512, inter_dim=512, experts=1, topk=1, harsh=True)
     torch.testing.assert_close(_run(case), _reference(case), rtol=5e-2, atol=1.0)
+
+
+@pytest.mark.skipif(not has_rocm(), reason="requires ROCm/HIP with an AMD GPU")
+def test_fused_moe_persistent_routes_match_reference():
+    torch.manual_seed(17)
+    case = _build_case(tokens=64, dim=512, inter_dim=512, experts=1, topk=1)
+    torch.testing.assert_close(
+        _run(case, num_persistent_tgs=2),
+        _reference(case),
+        rtol=PER_ELEMENT_RTOL,
+        atol=PER_ELEMENT_ATOL,
+    )
 
 
 @pytest.mark.skipif(not has_rocm(), reason="requires ROCm/HIP with an AMD GPU")

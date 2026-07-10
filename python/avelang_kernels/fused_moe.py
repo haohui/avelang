@@ -974,6 +974,7 @@ def _fused_moe_blockscale_fp8_kernel(
     m: S.u32,
     dim: S.u32,
     inter_dim: S.u32,
+    persistent_route_step: S.u32,
 ):
     del topk
 
@@ -981,7 +982,7 @@ def _fused_moe_blockscale_fp8_kernel(
     k_blocks = inter_dim // SCALE_BLOCK_SIZE
     tid = S.thread_id(0)
     tile_k = S.block_id(0)
-    route_group = S.block_id(1)
+    route_group_begin = S.block_id(1)
     wid = tid // WARP_SIZE
     wtid = tid % WARP_SIZE
     col_id = tid % SUBGROUP_SIZE
@@ -990,16 +991,18 @@ def _fused_moe_blockscale_fp8_kernel(
     num_valid_ids = g_num_valid_ids[0]
     num_tokens = g_num_valid_ids[1]
     num_valid_m_blocks = (num_valid_ids + ROUTES_PER_BLOCK - 1) // ROUTES_PER_BLOCK
-    route_base = route_group * ROUTES_PER_BLOCK
-
-    if route_group >= num_valid_m_blocks:
-        return
-    if route_base >= num_valid_ids:
-        return
-
-    g_sorted_token_ids = S.make_tensor(sorted_token_ids_ptr, S.u32, S.make_layout((num_valid_ids,), (1,)))
-    g_sorted_expert_ids = S.make_tensor(sorted_expert_ids_ptr, S.u32, S.make_layout((num_valid_m_blocks,), (1,)))
-    expert_id = g_sorted_expert_ids[route_group]
+    route_group_limit = num_valid_m_blocks
+    route_group_end = route_group_begin + 1
+    if persistent_route_step != 0:
+        route_group_end = route_group_limit
+    route_group_stride = persistent_route_step
+    if route_group_stride == 0:
+        route_group_stride = 1
+    route_group_iters = S.convert(0, S.u32)
+    if route_group_begin < route_group_end:
+        route_group_iters = (
+            route_group_end - route_group_begin + route_group_stride - 1
+        ) // route_group_stride
 
     act_memref = S.make_tensor(act_ptr, S.u8, S.make_layout((m * dim,), (1,)))
     w13_memref = S.make_tensor(w13_ptr, S.u8, S.make_layout((REF_BUFFER_RANGE,), (1,)))
@@ -1007,6 +1010,8 @@ def _fused_moe_blockscale_fp8_kernel(
     scale_act_memref = S.make_tensor(scales_act_ptr, S.u32, S.make_layout((n_blocks * m,), (1,)))
     scale_w13_memref = S.make_tensor(scales_w13_ptr, S.u32, S.make_layout((REF_BUFFER_RANGE // 4,), (1,)))
     scale_w2_memref = S.make_tensor(scales_w2_ptr, S.u32, S.make_layout((REF_BUFFER_RANGE // 4,), (1,)))
+    sorted_token_ids_memref = S.make_tensor(sorted_token_ids_ptr, S.u32, S.make_layout((REF_BUFFER_RANGE // 4,), (1,)))
+    sorted_expert_ids_memref = S.make_tensor(sorted_expert_ids_ptr, S.u32, S.make_layout((REF_BUFFER_RANGE // 4,), (1,)))
     out_bf16 = S.make_tensor(out_ptr, S.bf16, S.make_layout((2,), (1,)))
 
     act_rsrc = S.amdgpu.make_rsrc(act_memref, m * dim)
@@ -1015,22 +1020,9 @@ def _fused_moe_blockscale_fp8_kernel(
     w2_rsrc_all = S.amdgpu.make_rsrc(w2_memref, REF_BUFFER_RANGE)
     scale_w13_rsrc_all = S.amdgpu.make_rsrc(scale_w13_memref, REF_BUFFER_RANGE)
     scale_w2_rsrc_all = S.amdgpu.make_rsrc(scale_w2_memref, REF_BUFFER_RANGE)
-
-    token_select_x = g_sorted_token_ids[route_base + col_id] & 0x00FFFFFF
-    token_select_y = g_sorted_token_ids[route_base + col_id + SUBGROUP_SIZE] & 0x00FFFFFF
-
-    tokens = S.make_local((TOKEN_BATCH,), S.u32)
-    for i in S.range(TOKEN_BATCH):
-        token_idx = wid + i * 4
-        tokens[i] = g_sorted_token_ids[route_base + token_idx] & 0x00FFFFFF
-
-    invalid_token_mask = S.convert(0, S.u32)
-    for i in S.range(TOKEN_BATCH):
-        if tokens[i] >= num_tokens:
-            invalid_token_mask = invalid_token_mask | (S.convert(1, S.u32) << i)
-
-    sorted_weights = S.make_local((2,), S.f32)
-    _load_sorted_weights(sorted_weights, sorted_weights_ptr, num_valid_ids, tid, route_base)
+    sorted_token_ids_rsrc = S.amdgpu.make_rsrc(sorted_token_ids_memref, REF_BUFFER_RANGE)
+    sorted_expert_ids_rsrc = S.amdgpu.make_rsrc(sorted_expert_ids_memref, REF_BUFFER_RANGE)
+    zero = S.convert(0, S.u32)
 
     shared_words = S.make_shared((SHM_TOTAL_DWORDS,), S.u32)
     shm_max_words = S.subview(shared_words, (SHM_MAX_BASE,), (THREADS * 2,), (1,))
@@ -1038,71 +1030,111 @@ def _fused_moe_blockscale_fp8_kernel(
     shm_q_h = S.subview(shared_words, (SHM_Q_H_BASE,), (THREADS * 8,), (1,))
     shm_ret0 = S.subview(shared_words, (SHM_RET_BASE,), (RET_DWORDS,), (1,))
     shm_ret1 = S.subview(shared_words, (SHM_RET_BASE + RET_DWORDS,), (RET_DWORDS,), (1,))
+    for route_group_iter in S.range(route_group_iters):
+        route_group = route_group_begin + route_group_iter * route_group_stride
+        route_base = route_group * ROUTES_PER_BLOCK
+        if route_group < route_group_limit and route_base < num_valid_ids:
+            expert_id = S.amdgpu.raw_buffer_load_x1(
+                sorted_expert_ids_rsrc, zero, route_group * 4, 0
+            )
+            token_select_x = S.amdgpu.raw_buffer_load_x1(
+                sorted_token_ids_rsrc, zero, (route_base + col_id) * 4, 0
+            ) & 0x00FFFFFF
+            token_select_y = S.amdgpu.raw_buffer_load_x1(
+                sorted_token_ids_rsrc,
+                zero,
+                (route_base + col_id + SUBGROUP_SIZE) * 4,
+                0,
+            ) & 0x00FFFFFF
 
-    w1_value_offset_bytes = expert_id * (2 * inter_dim * dim) + tile_k * GROUP_DIM * dim
-    w1_scale_offset_bytes = (expert_id * (2 * k_blocks * n_blocks) + tile_k * (GROUP_DIM // SCALE_BLOCK_SIZE) * n_blocks) * 4
-    w3_value_offset_bytes = w1_value_offset_bytes + inter_dim * dim
-    w3_scale_offset_bytes = w1_scale_offset_bytes + k_blocks * n_blocks * 4
-    w2_value_offset_bytes = expert_id * (dim * inter_dim) + tile_k * (GROUP_DIM * 16)
-    w2_scale_offset_bytes = (expert_id * (n_blocks * k_blocks) + tile_k * (GROUP_DIM // SCALE_BLOCK_SIZE)) * 4
+            tokens = S.make_local((TOKEN_BATCH,), S.u32)
+            for i in S.range(TOKEN_BATCH):
+                token_idx = wid + i * 4
+                tokens[i] = S.amdgpu.raw_buffer_load_x1(
+                    sorted_token_ids_rsrc, zero, (route_base + token_idx) * 4, 0
+                ) & 0x00FFFFFF
 
-    w1_rsrc = w13_rsrc_all
-    w3_rsrc = w13_rsrc_all
-    w2_rsrc = w2_rsrc_all
-    w1_scale_rsrc = scale_w13_rsrc_all
-    w3_scale_rsrc = scale_w13_rsrc_all
-    w2_scale_rsrc = scale_w2_rsrc_all
-    act_scale_rsrc = scale_act_rsrc
+            invalid_token_mask = S.convert(0, S.u32)
+            for i in S.range(TOKEN_BATCH):
+                if tokens[i] >= num_tokens:
+                    invalid_token_mask = invalid_token_mask | (
+                        S.convert(1, S.u32) << i
+                    )
 
-    h = S.make_local((8, 4), S.f32)
-    _stage1(
-        h,
-        shared_words,
-        wid,
-        wtid,
-        tid,
-        token_select_x,
-        token_select_y,
-        tokens,
-        m,
-        dim,
-        act_rsrc,
-        act_scale_rsrc,
-        w1_rsrc,
-        w3_rsrc,
-        w1_scale_rsrc,
-        w3_scale_rsrc,
-        w1_value_offset_bytes,
-        w1_scale_offset_bytes,
-        w3_value_offset_bytes,
-        w3_scale_offset_bytes,
-    )
-    S.syncthreads()
+            sorted_weights = S.make_local((2,), S.f32)
+            _load_sorted_weights(
+                sorted_weights, sorted_weights_ptr, num_valid_ids, tid, route_base
+            )
 
-    quant_h = S.make_local((8, 4), S.u32)
-    dq_act = S.make_local((4,), S.f32)
-    _quantize_and_shuffle(quant_h, dq_act, shm_max, shm_q_h, tid, wid, wtid, h)
+            w1_value_offset_bytes = (
+                expert_id * (2 * inter_dim * dim) + tile_k * GROUP_DIM * dim
+            )
+            w1_scale_offset_bytes = (
+                expert_id * (2 * k_blocks * n_blocks)
+                + tile_k * (GROUP_DIM // SCALE_BLOCK_SIZE) * n_blocks
+            ) * 4
+            w3_value_offset_bytes = w1_value_offset_bytes + inter_dim * dim
+            w3_scale_offset_bytes = w1_scale_offset_bytes + k_blocks * n_blocks * 4
+            w2_value_offset_bytes = (
+                expert_id * (dim * inter_dim) + tile_k * (GROUP_DIM * 16)
+            )
+            w2_scale_offset_bytes = (
+                expert_id * (n_blocks * k_blocks)
+                + tile_k * (GROUP_DIM // SCALE_BLOCK_SIZE)
+            ) * 4
 
-    _stage2(
-        out_bf16,
-        shm_ret0,
-        shm_ret1,
-        quant_h,
-        dq_act,
-        sorted_weights,
-        invalid_token_mask,
-        tokens,
-        num_tokens,
-        tid,
-        wid,
-        wtid,
-        dim,
-        inter_dim,
-        w2_rsrc,
-        w2_scale_rsrc,
-        w2_value_offset_bytes,
-        w2_scale_offset_bytes,
-    )
+            h = S.make_local((8, 4), S.f32)
+            _stage1(
+                h,
+                shared_words,
+                wid,
+                wtid,
+                tid,
+                token_select_x,
+                token_select_y,
+                tokens,
+                m,
+                dim,
+                act_rsrc,
+                scale_act_rsrc,
+                w13_rsrc_all,
+                w13_rsrc_all,
+                scale_w13_rsrc_all,
+                scale_w13_rsrc_all,
+                w1_value_offset_bytes,
+                w1_scale_offset_bytes,
+                w3_value_offset_bytes,
+                w3_scale_offset_bytes,
+            )
+            S.syncthreads()
+
+            quant_h = S.make_local((8, 4), S.u32)
+            dq_act = S.make_local((4,), S.f32)
+            _quantize_and_shuffle(
+                quant_h, dq_act, shm_max, shm_q_h, tid, wid, wtid, h
+            )
+
+            _stage2(
+                out_bf16,
+                shm_ret0,
+                shm_ret1,
+                quant_h,
+                dq_act,
+                sorted_weights,
+                invalid_token_mask,
+                tokens,
+                num_tokens,
+                tid,
+                wid,
+                wtid,
+                dim,
+                inter_dim,
+                w2_rsrc_all,
+                scale_w2_rsrc_all,
+                w2_value_offset_bytes,
+                w2_scale_offset_bytes,
+            )
+        S.syncthreads()
 
 
 def _validate_fused_moe_fp8_blockscale_inputs(
@@ -1212,6 +1244,7 @@ def _fused_moe_fp8_blockscale_g1u1_impl(
     input_scale: torch.Tensor,
     fc1_scale: torch.Tensor,
     fc2_scale: torch.Tensor,
+    num_persistent_tgs: int = 0,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     _validate_fused_moe_fp8_blockscale_inputs(
@@ -1246,8 +1279,14 @@ def _fused_moe_fp8_blockscale_g1u1_impl(
     # The valid route count is device data and must not be synchronously read
     # on the host: doing so breaks CUDA graph capture.  The kernel guards each
     # speculative route group using num_valid_ids[0].
+    split_k = _ceil_div(inter_dim, GROUP_DIM)
     route_groups = max(1, sorted_expert_ids.numel())
-    grid = (_ceil_div(inter_dim, GROUP_DIM), route_groups, 1)
+    persistent_route_step = 0
+    if num_persistent_tgs > 0:
+        persistent_route_groups = _ceil_div(num_persistent_tgs, split_k)
+        route_groups = min(route_groups, max(1, persistent_route_groups))
+        persistent_route_step = route_groups
+    grid = (split_k, route_groups, 1)
     block = (THREADS, 1, 1)
 
     sorted_token_ids_i32 = sorted_token_ids.to(dtype=torch.int32)
@@ -1276,6 +1315,7 @@ def _fused_moe_fp8_blockscale_g1u1_impl(
         tokens,
         dim,
         inter_dim,
+        persistent_route_step,
         num_warps=NUM_WARPS,
     )
     return out
@@ -1293,6 +1333,7 @@ def fused_moe_fp8_blockscale_g1u1(
     input_scale: torch.Tensor,
     fc1_scale: torch.Tensor,
     fc2_scale: torch.Tensor,
+    num_persistent_tgs: int = 0,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return _fused_moe_fp8_blockscale_g1u1_impl(
@@ -1307,6 +1348,7 @@ def fused_moe_fp8_blockscale_g1u1(
         input_scale,
         fc1_scale,
         fc2_scale,
+        num_persistent_tgs,
         out,
     )
 
