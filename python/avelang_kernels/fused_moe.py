@@ -377,15 +377,17 @@ def _matmul_stage0(
             scale_pair = S.make_local((2,), S.f32)
             scale_pair[0] = s
             scale_pair[1] = s
+            scale_pair_vec = S.view(scale_pair, S.Tensor((1, 2), S.f32))[0]
             for pair in S.range(2):
                 src_pair = S.make_local((2,), S.f32)
                 dst_pair = S.make_local((2,), S.f32)
                 for elem in S.range(2):
                     src_pair[elem] = acc[pair * 2 + elem]
                     dst_pair[elem] = t[i * 2 + row, pair * 2 + elem]
-                pair_val = S.make_local((2,), S.f32)
+                src_pair_vec = S.view(src_pair, S.Tensor((1, 2), S.f32))[0]
+                dst_pair_vec = S.view(dst_pair, S.Tensor((1, 2), S.f32))[0]
+                pair_val = S.fma(scale_pair_vec, src_pair_vec, dst_pair_vec)
                 for elem in S.range(2):
-                    pair_val[elem] = scale_pair[elem] * src_pair[elem] + dst_pair[elem]
                     t[i * 2 + row, pair * 2 + elem] = pair_val[elem]
 
 
@@ -421,15 +423,17 @@ def _matmul_stage1(
             scale_pair = S.make_local((2,), S.f32)
             scale_pair[0] = s
             scale_pair[1] = s
+            scale_pair_vec = S.view(scale_pair, S.Tensor((1, 2), S.f32))[0]
             for pair in S.range(2):
                 src_pair = S.make_local((2,), S.f32)
                 dst_pair = S.make_local((2,), S.f32)
                 for elem in S.range(2):
                     src_pair[elem] = acc[pair * 2 + elem]
                     dst_pair[elem] = t[i * 2 + row, pair * 2 + elem]
-                pair_val = S.make_local((2,), S.f32)
+                src_pair_vec = S.view(src_pair, S.Tensor((1, 2), S.f32))[0]
+                dst_pair_vec = S.view(dst_pair, S.Tensor((1, 2), S.f32))[0]
+                pair_val = S.fma(scale_pair_vec, src_pair_vec, dst_pair_vec)
                 for elem in S.range(2):
-                    pair_val[elem] = scale_pair[elem] * src_pair[elem] + dst_pair[elem]
                     t[i * 2 + row, pair * 2 + elem] = pair_val[elem]
 
 
@@ -441,9 +445,35 @@ def _silu_dot(
 ):
     minus_log2e = S.convert(-1.4426950408889634, S.f32)
     one = S.convert(1.0, S.f32)
-    for i in S.range(4):
-        inv = S.amdgpu.rcp(one + S.exp2(gate[i] * minus_log2e))
-        ret[i] = gate[i] * inv * up[i]
+    minus_log2e_pair = S.make_local((2,), S.f32)
+    one_pair = S.make_local((2,), S.f32)
+    minus_log2e_pair[0] = minus_log2e
+    minus_log2e_pair[1] = minus_log2e
+    one_pair[0] = one
+    one_pair[1] = one
+    minus_log2e_pair_vec = S.view(minus_log2e_pair, S.Tensor((1, 2), S.f32))[0]
+    one_pair_vec = S.view(one_pair, S.Tensor((1, 2), S.f32))[0]
+    for pair in S.range(2):
+        gate_pair = S.make_local((2,), S.f32)
+        up_pair = S.make_local((2,), S.f32)
+        inv_pair = S.make_local((2,), S.f32)
+        for elem in S.range(2):
+            gate_pair[elem] = gate[pair * 2 + elem]
+            up_pair[elem] = up[pair * 2 + elem]
+        gate_pair_vec = S.view(gate_pair, S.Tensor((1, 2), S.f32))[0]
+        up_pair_vec = S.view(up_pair, S.Tensor((1, 2), S.f32))[0]
+        scaled_pair = gate_pair_vec * minus_log2e_pair_vec
+        exp_pair = S.make_local((2,), S.f32)
+        for elem in S.range(2):
+            exp_pair[elem] = S.exp2(scaled_pair[elem])
+        exp_pair_vec = S.view(exp_pair, S.Tensor((1, 2), S.f32))[0]
+        exp_plus_one = exp_pair_vec + one_pair_vec
+        for elem in S.range(2):
+            inv_pair[elem] = S.amdgpu.rcp(exp_plus_one[elem])
+        inv_pair_vec = S.view(inv_pair, S.Tensor((1, 2), S.f32))[0]
+        pair_val = gate_pair_vec * inv_pair_vec * up_pair_vec
+        for elem in S.range(2):
+            ret[pair * 2 + elem] = pair_val[elem]
 
 
 @avelang.jit
@@ -664,15 +694,28 @@ def _quantize_and_shuffle(
     _compute_row_max(shm_max, h, tid, quant_scale, dq_act)
 
     q = S.make_local((8,), S.u32)
-    zero = S.convert(0, S.u32)
     for i in S.range(8):
         row = i % 2
         half = i // 4
         s = quant_scale[half * 2 + row]
-        v = h[i]
-        u0 = S.amdgpu.cvt_pk_fp8_f32(v[0] * s, v[1] * s, zero, 0)
-        u1 = S.amdgpu.cvt_pk_fp8_f32(v[2] * s, v[3] * s, zero, 0)
-        q[i] = (u1 << 16) | u0
+        s_pair = S.make_local((2,), S.f32)
+        s_pair[0] = s
+        s_pair[1] = s
+        xy_in = S.make_local((2,), S.f32)
+        zw_in = S.make_local((2,), S.f32)
+        xy_in[0] = h[i, 0]
+        xy_in[1] = h[i, 1]
+        zw_in[0] = h[i, 2]
+        zw_in[1] = h[i, 3]
+        s_pair_vec = S.view(s_pair, S.Tensor((1, 2), S.f32))[0]
+        xy_in_vec = S.view(xy_in, S.Tensor((1, 2), S.f32))[0]
+        zw_in_vec = S.view(zw_in, S.Tensor((1, 2), S.f32))[0]
+        xy = xy_in_vec * s_pair_vec
+        zw = zw_in_vec * s_pair_vec
+        qi = S.convert(0, S.u32)
+        qi = S.amdgpu.cvt_pk_fp8_f32(xy[0], xy[1], qi, 0)
+        qi = S.amdgpu.cvt_pk_fp8_f32(zw[0], zw[1], qi, 1)
+        q[i] = qi
 
     for i in S.range(8):
         idx = (
@@ -703,9 +746,19 @@ def _multiply_route_weights(
 ):
     for i in S.range(2):
         rw = sorted_weights[i]
+        rw_pair = S.make_local((2,), S.f32)
+        rw_pair[0] = rw
+        rw_pair[1] = rw
+        rw_pair_vec = S.view(rw_pair, S.Tensor((1, 2), S.f32))[0]
         for j in S.range(4):
-            for k in S.range(4):
-                t[j * 2 + i, k] = t[j * 2 + i, k] * rw
+            for pair in S.range(2):
+                src_pair = S.make_local((2,), S.f32)
+                src_pair[0] = t[j * 2 + i, pair * 2 + 0]
+                src_pair[1] = t[j * 2 + i, pair * 2 + 1]
+                src_pair_vec = S.view(src_pair, S.Tensor((1, 2), S.f32))[0]
+                pair_val = src_pair_vec * rw_pair_vec
+                t[j * 2 + i, pair * 2 + 0] = pair_val[0]
+                t[j * 2 + i, pair * 2 + 1] = pair_val[1]
 
 
 @avelang.jit
