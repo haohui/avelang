@@ -338,6 +338,46 @@ def _load_sorted_weights(
 
 
 @avelang.jit
+def _hot_loop_scheduler_stage1():
+    S.amdgpu.sched_group_barrier(0x20, 1, 0)
+    S.amdgpu.sched_group_barrier(0x8, 4, 0)
+    S.amdgpu.sched_group_barrier(0x20, 1, 0)
+    S.amdgpu.sched_group_barrier(0x8, 4, 0)
+    S.amdgpu.sched_group_barrier(0x20, 1, 0)
+    S.amdgpu.sched_group_barrier(0x8, 4, 0)
+    S.amdgpu.sched_group_barrier(0x20, 1, 0)
+    S.amdgpu.sched_group_barrier(0x8, 4, 0)
+    S.amdgpu.sched_group_barrier(0x20, 1, 0)
+    S.amdgpu.sched_group_barrier(0x8, 4, 0)
+    S.amdgpu.sched_group_barrier(0x20, 1, 0)
+    S.amdgpu.sched_group_barrier(0x8, 4, 0)
+    S.amdgpu.sched_group_barrier(0x1, 1, 0)
+    S.amdgpu.sched_group_barrier(0x8, 4, 0)
+    S.amdgpu.sched_group_barrier(0x1, 1, 0)
+    S.amdgpu.sched_group_barrier(0x8, 4, 0)
+    S.amdgpu.sched_barrier(0)
+
+
+@avelang.jit
+def _hot_loop_scheduler_stage2():
+    S.amdgpu.sched_group_barrier(0x200, 1, 0)
+    S.amdgpu.sched_group_barrier(0x8, 4, 0)
+    S.amdgpu.sched_group_barrier(0x20, 1, 0)
+    S.amdgpu.sched_group_barrier(0x8, 4, 0)
+    S.amdgpu.sched_group_barrier(0x20, 1, 0)
+    S.amdgpu.sched_group_barrier(0x8, 4, 0)
+    S.amdgpu.sched_group_barrier(0x20, 1, 0)
+    S.amdgpu.sched_group_barrier(0x8, 4, 0)
+    S.amdgpu.sched_group_barrier(0x100, 1, 0)
+    S.amdgpu.sched_group_barrier(0x8, 4, 0)
+    S.amdgpu.sched_group_barrier(0x1, 1, 0)
+    S.amdgpu.sched_group_barrier(0x8, 4, 0)
+    S.amdgpu.sched_group_barrier(0x1, 1, 0)
+    S.amdgpu.sched_group_barrier(0x8, 4, 0)
+    S.amdgpu.sched_barrier(0)
+
+
+@avelang.jit
 def _clear_f32x4_matrix(mat: S.Tensor((8, 4), S.f32)):
     zero = S.convert(0.0, S.f32)
     for i in S.range(8):
@@ -553,6 +593,7 @@ def _stage1(
         d = iter_idx * (2 * GROUP_DIM)
         S.syncthreads()
 
+        _hot_loop_scheduler_stage1()
         _input_fetch_async(shared_words, act_rsrc, SHM_X1_BASE, dim, d + GROUP_DIM, wid, wtid, tokens)
         _input_fetch_scale_async(
             shared_words,
@@ -892,6 +933,7 @@ def _stage2(
             t = S.make_local((8, 4), S.f32)
             _clear_f32x4_matrix(t)
             ret = S.make_local((8, 2), S.u32)
+            _hot_loop_scheduler_stage2()
             if curr == 0:
                 if tile_d + GROUP_N < dim:
                     _w2_load_tile_stage0(w2_next_stage0, w2_rsrc, w2_value_offset_bytes, inter_dim, wid, wtid)
