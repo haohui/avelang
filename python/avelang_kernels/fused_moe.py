@@ -66,9 +66,7 @@ def _abs_f32(x: S.f32) -> S.f32:
 
 @avelang.jit
 def _max_f32(lhs: S.f32, rhs: S.f32) -> S.f32:
-    if rhs > lhs:
-        return rhs
-    return lhs
+    return S.max(lhs, rhs)
 
 
 @avelang.jit
@@ -94,8 +92,7 @@ def _max4(v: S.Tensor((4,), S.f32)) -> S.f32:
     m = _abs_f32(v[0])
     for i in S.range(3):
         av = _abs_f32(v[i + 1])
-        if av > m:
-            m = av
+        m = _max_nonneg_f32(m, av)
     return m
 
 
@@ -322,19 +319,27 @@ def _input_fetch_scale_to_reg(
 @avelang.jit
 def _load_sorted_weights(
     ret: S.Tensor((2,), S.f32),
-    sorted_weights_ptr: S.Pointer(S.u32),
-    sorted_weights_len: S.u32,
+    sorted_weights_rsrc: S.Tensor((4,), S.u32),
     tid: S.u32,
     route_base: S.u32,
 ):
-    sorted_weights = S.make_tensor(
-        sorted_weights_ptr,
-        S.u32,
-        S.make_layout((sorted_weights_len,), (1,)),
-    )
     lane = tid % SUBGROUP_SIZE
-    ret[0] = S.bitcast(sorted_weights[route_base + lane], S.f32)
-    ret[1] = S.bitcast(sorted_weights[route_base + lane + SUBGROUP_SIZE], S.f32)
+    route_base_bytes = route_base * 4
+    ret[0] = S.bitcast(
+        S.amdgpu.raw_buffer_load_x1(
+            sorted_weights_rsrc, lane * 4, route_base_bytes, 0
+        ),
+        S.f32,
+    )
+    ret[1] = S.bitcast(
+        S.amdgpu.raw_buffer_load_x1(
+            sorted_weights_rsrc,
+            (lane + SUBGROUP_SIZE) * 4,
+            route_base_bytes,
+            0,
+        ),
+        S.f32,
+    )
 
 
 @avelang.jit
@@ -688,17 +693,13 @@ def _compute_row_max(
         lm3 = _abs_f32(h[base + 3, 0])
         for j in S.range(3):
             v0 = _abs_f32(h[base + 0, j + 1])
-            if v0 > lm0:
-                lm0 = v0
+            lm0 = _max_nonneg_f32(lm0, v0)
             v2 = _abs_f32(h[base + 2, j + 1])
-            if v2 > lm2:
-                lm2 = v2
+            lm2 = _max_nonneg_f32(lm2, v2)
             v1 = _abs_f32(h[base + 1, j + 1])
-            if v1 > lm1:
-                lm1 = v1
+            lm1 = _max_nonneg_f32(lm1, v1)
             v3 = _abs_f32(h[base + 3, j + 1])
-            if v3 > lm3:
-                lm3 = v3
+            lm3 = _max_nonneg_f32(lm3, v3)
         lm_x = _max_nonneg_f32(local_max_floor, _max_nonneg_f32(lm0, lm2))
         lm_y = _max_nonneg_f32(local_max_floor, _max_nonneg_f32(lm1, lm3))
         shm_max_flat[tid * 2] = lm_x
@@ -1053,6 +1054,7 @@ def _fused_moe_blockscale_fp8_kernel(
     scale_w13_memref = S.make_tensor(scales_w13_ptr, S.u32, S.make_layout((REF_BUFFER_RANGE // 4,), (1,)))
     scale_w2_memref = S.make_tensor(scales_w2_ptr, S.u32, S.make_layout((REF_BUFFER_RANGE // 4,), (1,)))
     sorted_token_ids_memref = S.make_tensor(sorted_token_ids_ptr, S.u32, S.make_layout((REF_BUFFER_RANGE // 4,), (1,)))
+    sorted_weights_memref = S.make_tensor(sorted_weights_ptr, S.u32, S.make_layout((REF_BUFFER_RANGE // 4,), (1,)))
     sorted_expert_ids_memref = S.make_tensor(sorted_expert_ids_ptr, S.u32, S.make_layout((REF_BUFFER_RANGE // 4,), (1,)))
     out_bf16 = S.make_tensor(out_ptr, S.bf16, S.make_layout((2,), (1,)))
 
@@ -1063,6 +1065,7 @@ def _fused_moe_blockscale_fp8_kernel(
     scale_w13_rsrc_all = S.amdgpu.make_rsrc(scale_w13_memref, REF_BUFFER_RANGE)
     scale_w2_rsrc_all = S.amdgpu.make_rsrc(scale_w2_memref, REF_BUFFER_RANGE)
     sorted_token_ids_rsrc = S.amdgpu.make_rsrc(sorted_token_ids_memref, REF_BUFFER_RANGE)
+    sorted_weights_rsrc = S.amdgpu.make_rsrc(sorted_weights_memref, REF_BUFFER_RANGE)
     sorted_expert_ids_rsrc = S.amdgpu.make_rsrc(sorted_expert_ids_memref, REF_BUFFER_RANGE)
     zero = S.convert(0, S.u32)
 
@@ -1075,17 +1078,18 @@ def _fused_moe_blockscale_fp8_kernel(
     for route_group_iter in S.range(route_group_iters):
         route_group = route_group_begin + route_group_iter * route_group_stride
         route_base = route_group * ROUTES_PER_BLOCK
+        route_base_bytes = route_base * 4
         if route_group < route_group_limit and route_base < num_valid_ids:
             expert_id = S.amdgpu.raw_buffer_load_x1(
                 sorted_expert_ids_rsrc, zero, route_group * 4, 0
             )
             token_select_x = S.amdgpu.raw_buffer_load_x1(
-                sorted_token_ids_rsrc, zero, (route_base + col_id) * 4, 0
+                sorted_token_ids_rsrc, col_id * 4, route_base_bytes, 0
             ) & 0x00FFFFFF
             token_select_y = S.amdgpu.raw_buffer_load_x1(
                 sorted_token_ids_rsrc,
-                zero,
-                (route_base + col_id + SUBGROUP_SIZE) * 4,
+                (col_id + SUBGROUP_SIZE) * 4,
+                route_base_bytes,
                 0,
             ) & 0x00FFFFFF
 
@@ -1093,7 +1097,7 @@ def _fused_moe_blockscale_fp8_kernel(
             for i in S.range(TOKEN_BATCH):
                 token_idx = wid + i * 4
                 tokens[i] = S.amdgpu.raw_buffer_load_x1(
-                    sorted_token_ids_rsrc, zero, (route_base + token_idx) * 4, 0
+                    sorted_token_ids_rsrc, token_idx * 4, route_base_bytes, 0
                 ) & 0x00FFFFFF
 
             invalid_token_mask = S.convert(0, S.u32)
@@ -1105,7 +1109,7 @@ def _fused_moe_blockscale_fp8_kernel(
 
             sorted_weights = S.make_local((2,), S.f32)
             _load_sorted_weights(
-                sorted_weights, sorted_weights_ptr, num_valid_ids, tid, route_base
+                sorted_weights, sorted_weights_rsrc, tid, route_base
             )
 
             w1_value_offset_bytes = (

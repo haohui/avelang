@@ -181,10 +181,17 @@ def _benchmark(
     args: tuple[torch.Tensor | int, ...],
     warmup: int,
     iters: int,
+    setup: Callable[[], None] | None = None,
 ) -> float:
+    if setup is not None:
+        setup()
     for _ in range(warmup):
         fn(*args)
     torch.cuda.synchronize()
+
+    if setup is not None:
+        setup()
+        torch.cuda.synchronize()
 
     start_evt = torch.cuda.Event(enable_timing=True)
     end_evt = torch.cuda.Event(enable_timing=True)
@@ -194,6 +201,78 @@ def _benchmark(
     end_evt.record()
     torch.cuda.synchronize()
     return start_evt.elapsed_time(end_evt) / iters
+
+
+def _make_avelang_kernel_launcher(
+    args: tuple[torch.Tensor | int, ...],
+) -> tuple[Callable[[], torch.Tensor], Callable[[], None], torch.Tensor]:
+    (
+        input_q,
+        w13_q,
+        w2_q,
+        sorted_token_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        topk,
+        input_scale,
+        fc1_scale,
+        fc2_scale,
+    ) = args
+    assert isinstance(input_q, torch.Tensor)
+    assert isinstance(w13_q, torch.Tensor)
+    assert isinstance(w2_q, torch.Tensor)
+    assert isinstance(sorted_token_ids, torch.Tensor)
+    assert isinstance(sorted_weights, torch.Tensor)
+    assert isinstance(sorted_expert_ids, torch.Tensor)
+    assert isinstance(num_valid_ids, torch.Tensor)
+    assert isinstance(topk, int)
+    assert isinstance(input_scale, torch.Tensor)
+    assert isinstance(fc1_scale, torch.Tensor)
+    assert isinstance(fc2_scale, torch.Tensor)
+
+    out = torch.zeros(input_q.shape, dtype=torch.bfloat16, device=input_q.device)
+    tokens, dim = input_q.shape
+    inter_dim = w2_q.shape[-1]
+    split_k = (inter_dim + GROUP_DIM - 1) // GROUP_DIM
+    route_groups = max(1, sorted_expert_ids.numel())
+    grid = (split_k, route_groups, 1)
+    block = (fused_moe.THREADS, 1, 1)
+
+    sorted_token_ids_i32 = sorted_token_ids.to(dtype=torch.int32)
+    sorted_expert_ids_i32 = sorted_expert_ids.to(dtype=torch.int32)
+    num_valid_ids_i32 = num_valid_ids.to(dtype=torch.int32)
+    sorted_weights_u32 = sorted_weights.view(torch.uint32)
+    input_scale_u32 = input_scale.transpose(0, 1).contiguous().view(torch.uint32)
+    fc1_scale_u32 = fc1_scale.view(torch.uint32)
+    fc2_scale_u32 = fc2_scale.view(torch.uint32)
+
+    def reset_output() -> None:
+        out.zero_()
+
+    def launch() -> torch.Tensor:
+        fused_moe._fused_moe_blockscale_fp8_kernel[lambda: (grid, block)](
+            out,
+            input_q.view(torch.uint8),
+            w13_q.view(torch.uint8),
+            w2_q.view(torch.uint8),
+            sorted_token_ids_i32,
+            sorted_weights_u32,
+            sorted_expert_ids_i32,
+            num_valid_ids_i32,
+            topk,
+            input_scale_u32,
+            fc1_scale_u32,
+            fc2_scale_u32,
+            tokens,
+            dim,
+            inter_dim,
+            0,
+            num_warps=fused_moe.NUM_WARPS,
+        )
+        return out
+
+    return launch, reset_output, out
 
 
 def _error_metrics(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, float]:
@@ -228,9 +307,10 @@ def run_benchmark(
     if compare_petit and petit_kernel is None:
         raise RuntimeError("--compare-petit requires petit_kernel to be importable.")
     args = _make_case(tokens, dim, inter_dim, experts, topk, seed)
+    avelang_launch, avelang_reset, _ = _make_avelang_kernel_launcher(args)
 
     avelang_ms = _benchmark(
-        fused_moe.fused_moe_fp8_blockscale_g1u1, args, warmup, iters
+        avelang_launch, (), warmup, iters, setup=avelang_reset
     )
     flops = 6.0 * tokens * topk * dim * inter_dim
     avelang_tflops = flops / (avelang_ms * 1e-3) / 1e12
@@ -284,8 +364,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Benchmark AveLang fused_moe_fp8_blockscale_g1u1. This measures "
-            "public Python wrapper calls, including output allocation. Use "
-            "--compare-petit to also benchmark petit-kernel when installed."
+            "the staged device kernel launch, with output cleared once before "
+            "timing to match the Petit C++ benchmark loop. Use --compare-petit "
+            "to also benchmark petit-kernel when installed."
         )
     )
     parser.add_argument("--tokens", type=int, required=True)
