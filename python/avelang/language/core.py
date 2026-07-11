@@ -129,7 +129,12 @@ def min(lhs, rhs):
 
 
 def max(lhs, rhs):
-    """Compute the unsigned maximum of two integer values."""
+    """Compute the maximum of two compatible integer or floating-point values."""
+    pass
+
+
+def select(pred, true_value, false_value):
+    """Select true_value when pred is true, otherwise false_value."""
     pass
 
 

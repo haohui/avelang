@@ -397,9 +397,9 @@ CreatePrintfFunction(ast::Call *call_expr, GeneratorContext *ctx,
 
 template <typename SignedOpType, typename UnsignedOpType>
 static mlir::Value
-CreateIntegerExtremaFunction(ast::Call *call_expr, GeneratorContext *ctx,
-                             llvm::ArrayRef<mlir::Value> resolved_args,
-                             llvm::StringRef function_name) {
+CreateExtremaFunction(ast::Call *call_expr, GeneratorContext *ctx,
+                      llvm::ArrayRef<mlir::Value> resolved_args,
+                      llvm::StringRef function_name) {
     if (call_expr->GetArgs().size() != 2 || resolved_args.size() != 2 ||
         !resolved_args[0] || !resolved_args[1]) {
         std::string message = ("avelang." + function_name +
@@ -413,7 +413,7 @@ CreateIntegerExtremaFunction(ast::Call *call_expr, GeneratorContext *ctx,
 
     auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
     auto location = GetCallLocation(ctx, call_expr);
-    auto [lhs, rhs] = causalflow::avelang::ir::ConvertTypesForBitwise(
+    auto [lhs, rhs] = causalflow::avelang::ir::ConvertTypesForArithmetic(
         resolved_args[0], resolved_args[1], builder, location);
     if (!lhs || !rhs) {
         std::string message = ("avelang." + function_name +
@@ -423,6 +423,11 @@ CreateIntegerExtremaFunction(ast::Call *call_expr, GeneratorContext *ctx,
                                         call_expr->GetSourceRange().getBegin())
             << message;
         return nullptr;
+    }
+
+    if (function_name == "max" && mlir::isa<mlir::FloatType>(lhs.getType())) {
+        return mlir::arith::MaxNumFOp::create(builder, location, lhs, rhs)
+            .getResult();
     }
 
     if (!IsIntegerValueOrVectorOfIntegers(lhs.getType()) &&
@@ -453,6 +458,42 @@ CreateIntegerExtremaFunction(ast::Call *call_expr, GeneratorContext *ctx,
         result = SignedOpType::create(builder, location, lhs, rhs);
     }
     SetTypeInfo(result, TypeInfo{isUnsigned});
+    return result;
+}
+
+static mlir::Value
+CreateSelectFunction(ast::Call *call_expr, GeneratorContext *ctx,
+                     llvm::ArrayRef<mlir::Value> resolved_args) {
+    if (call_expr->GetArgs().size() != 3 || resolved_args.size() != 3 ||
+        !resolved_args[0] || !resolved_args[1] || !resolved_args[2]) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "avelang.select() expects exactly 3 arguments";
+        return nullptr;
+    }
+
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = GetCallLocation(ctx, call_expr);
+    auto predicate = resolved_args[0];
+    if (!predicate.getType().isInteger(1)) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "avelang.select() expects an i1 predicate";
+        return nullptr;
+    }
+
+    auto [true_value, false_value] = ConvertTypesForArithmetic(
+        resolved_args[1], resolved_args[2], builder, location);
+    if (!true_value || !false_value) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "avelang.select() requires compatible value operands";
+        return nullptr;
+    }
+
+    auto result = mlir::arith::SelectOp::create(builder, location, predicate,
+                                                 true_value, false_value);
+    SetTypeInfo(result.getResult(), GetTypeInfo(true_value));
     return result;
 }
 
@@ -642,17 +683,24 @@ void AveLangModule::Initialize() {
     AddFunction("min",
                 [](ast::Call *call_expr, GeneratorContext *gen_ctx,
                    llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
-                    return CreateIntegerExtremaFunction<mlir::arith::MinSIOp,
-                                                        mlir::arith::MinUIOp>(
+                    return CreateExtremaFunction<mlir::arith::MinSIOp,
+                                                 mlir::arith::MinUIOp>(
                         call_expr, gen_ctx, resolved_args, "min");
                 });
 
     AddFunction("max",
                 [](ast::Call *call_expr, GeneratorContext *gen_ctx,
                    llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
-                    return CreateIntegerExtremaFunction<mlir::arith::MaxSIOp,
-                                                        mlir::arith::MaxUIOp>(
+                    return CreateExtremaFunction<mlir::arith::MaxSIOp,
+                                                 mlir::arith::MaxUIOp>(
                         call_expr, gen_ctx, resolved_args, "max");
+                });
+
+    AddFunction("select",
+                [](ast::Call *call_expr, GeneratorContext *gen_ctx,
+                   llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+                    return CreateSelectFunction(call_expr, gen_ctx,
+                                                resolved_args);
                 });
 
     AddFunction("block_id",

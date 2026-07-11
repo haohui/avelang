@@ -1005,15 +1005,24 @@ def gpu_test(a: S.Tensor((32, 32), S.i32)):
     RunMLIRGenerationTest(kSourceCode);
 }
 
-TEST_F(MLIRGeneratorTest, GenerateMLIRUnsignedMinMaxBuiltins) {
+TEST_F(MLIRGeneratorTest, GenerateMLIRMaxBuiltins) {
     static const std::string kSourceCode = R"""""(
 import avelang
 import avelang.language as S
 
 @avelang.jit
-def unsigned_min_max(lhs: S.u32, rhs: S.u32):
-    lo = S.min(lhs, rhs)
-    hi = S.max(lhs, rhs)
+def max_builtins(
+    signed_lhs: S.i32,
+    signed_rhs: S.i32,
+    unsigned_lhs: S.u32,
+    unsigned_rhs: S.u32,
+    float_lhs: S.f32,
+    float_rhs: S.f32,
+):
+    unsigned_lo = S.min(unsigned_lhs, unsigned_rhs)
+    signed_hi = S.max(signed_lhs, signed_rhs)
+    unsigned_hi = S.max(unsigned_lhs, unsigned_rhs)
+    float_hi = S.max(float_lhs, float_rhs)
 )""""";
 
     ast::ASTNode *root;
@@ -1031,24 +1040,85 @@ def unsigned_min_max(lhs: S.u32, rhs: S.u32):
     ASSERT_NE(mlir, nullptr);
 
     bool foundMinUI = false;
+    bool foundMaxSI = false;
     bool foundMaxUI = false;
+    bool foundMaxNumF = false;
     mlir->walk([&](mlir::arith::MinUIOp op) {
         foundMinUI = true;
+        EXPECT_TRUE(op.getType().isInteger(32));
+    });
+    mlir->walk([&](mlir::arith::MaxSIOp op) {
+        foundMaxSI = true;
         EXPECT_TRUE(op.getType().isInteger(32));
     });
     mlir->walk([&](mlir::arith::MaxUIOp op) {
         foundMaxUI = true;
         EXPECT_TRUE(op.getType().isInteger(32));
     });
+    mlir->walk([&](mlir::arith::MaxNumFOp op) {
+        foundMaxNumF = true;
+        EXPECT_TRUE(op.getType().isF32());
+    });
 
     EXPECT_TRUE(foundMinUI);
+    EXPECT_TRUE(foundMaxSI);
     EXPECT_TRUE(foundMaxUI);
+    EXPECT_TRUE(foundMaxNumF);
 
     mlir::PassManager pm(mlir.getContext());
     pm.addPass(mlir::createCanonicalizerPass());
     pm.addPass(mlir::createSymbolDCEPass());
     ASSERT_TRUE(mlir::succeeded(pm.run(mlir))) << "Pass pipeline failed";
 
+    ASSERT_TRUE(mlir::succeeded(mlir::verify(mlir)))
+        << "MLIR verification failed!";
+}
+
+TEST_F(MLIRGeneratorTest, GenerateMLIRSelectBuiltin) {
+    static const std::string kSourceCode = R""""""(
+import avelang
+import avelang.language as S
+
+@avelang.jit
+def select_builtin(value: S.i32, true_value: S.i32, false_value: S.i32):
+    result = S.select(value < 32, true_value, false_value)
+)"""""";
+
+    ast::ASTNode *root;
+    TryParse(kSourceCode, &root);
+    ASSERT_NE(root, nullptr);
+
+    auto ir_context = ir::IRContext::Create();
+    ir::MLIRGenerator generator(ir_context.get(), diagnostics_);
+    auto mlir = generator.Generate(root);
+
+    const clang::SourceManager &SM = diagnostics_->GetSourceManager();
+    ASSERT_FALSE(diagnostics_->GetEngine()->hasErrorOccurred())
+        << diagHandler_.GetErrorMessages(&SM);
+    ASSERT_NE(mlir, nullptr);
+
+    bool found_signed_less_than = false;
+    bool found_select = false;
+    mlir->walk([&](mlir::arith::CmpIOp op) {
+        if (op.getPredicate() == mlir::arith::CmpIPredicate::slt) {
+            found_signed_less_than = true;
+            EXPECT_TRUE(op.getLhs().getType().isInteger(32));
+            EXPECT_TRUE(op.getRhs().getType().isInteger(32));
+        }
+    });
+    mlir->walk([&](mlir::arith::SelectOp op) {
+        found_select = true;
+        EXPECT_TRUE(op.getCondition().getType().isInteger(1));
+        EXPECT_TRUE(op.getType().isInteger(32));
+    });
+
+    EXPECT_TRUE(found_signed_less_than);
+    EXPECT_TRUE(found_select);
+
+    mlir::PassManager pm(mlir.getContext());
+    pm.addPass(mlir::createCanonicalizerPass());
+    pm.addPass(mlir::createSymbolDCEPass());
+    ASSERT_TRUE(mlir::succeeded(pm.run(mlir))) << "Pass pipeline failed";
     ASSERT_TRUE(mlir::succeeded(mlir::verify(mlir)))
         << "MLIR verification failed!";
 }
