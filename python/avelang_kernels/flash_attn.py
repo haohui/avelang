@@ -3,6 +3,7 @@
 import math
 import avelang
 import avelang.language as al
+from avelang.language import invariant
 import torch
 
 WARP_SIZE = 64
@@ -299,6 +300,8 @@ def _gemm_qk_word_regs_batch0_small(
     q_regs: al.Tensor((Q_BATCHES, 2, 2), al.u32),
     k_regs: al.Tensor((Q_BATCHES, 2, 2), al.u32),
 ):
+    invariant.tag(q_regs, lambda q_batch, mfma_k, word: (q_batch, mfma_k, word), "FlashQFragment")
+    invariant.tag(k_regs, lambda q_batch, mfma_k, word: (q_batch, mfma_k, word), "FlashKFragment")
     zero_f32 = al.convert(0.0, al.f32)
     for t in al.range(16):
         score_acc[0, t] = zero_f32
@@ -308,6 +311,8 @@ def _gemm_qk_word_regs_batch0_small(
         mfma_k = mfma_idx - q_batch * 2
         q_frag = q_regs[q_batch, mfma_k]
         k_frag = k_regs[q_batch, mfma_k]
+        invariant.assert_tag_eq(q_regs[q_batch, mfma_k, 0], k_regs[q_batch, mfma_k, 0])
+        invariant.assert_tag_eq(q_regs[q_batch, mfma_k, 1], k_regs[q_batch, mfma_k, 1])
         score_acc[0] = al.amdgpu.mfma_32x32x8_bf16_f32(k_frag, q_frag, score_acc[0])
     _hot_loop_scheduler_qk_major()
 
@@ -316,6 +321,8 @@ def _gemm_qk_word_regs_batch0_small(
         mfma_k = mfma_idx - q_batch * 2
         q_frag = q_regs[q_batch, mfma_k]
         k_frag = k_regs[q_batch, mfma_k]
+        invariant.assert_tag_eq(q_regs[q_batch, mfma_k, 0], k_regs[q_batch, mfma_k, 0])
+        invariant.assert_tag_eq(q_regs[q_batch, mfma_k, 1], k_regs[q_batch, mfma_k, 1])
         score_acc[0] = al.amdgpu.mfma_32x32x8_bf16_f32(k_frag, q_frag, score_acc[0])
     _hot_loop_scheduler_qk_minor()
 
@@ -326,6 +333,8 @@ def _gemm_qk_word_regs_batch1_small(
     q_regs: al.Tensor((Q_BATCHES, 2, 2), al.u32),
     k_regs: al.Tensor((Q_BATCHES, 2, 2), al.u32),
 ):
+    invariant.tag(q_regs, lambda q_batch, mfma_k, word: (q_batch, mfma_k, word), "FlashQFragment")
+    invariant.tag(k_regs, lambda q_batch, mfma_k, word: (q_batch, mfma_k, word), "FlashKFragment")
     zero_f32 = al.convert(0.0, al.f32)
     for t in al.range(16):
         score_acc[1, t] = zero_f32
@@ -335,6 +344,8 @@ def _gemm_qk_word_regs_batch1_small(
         mfma_k = mfma_idx - q_batch * 2
         q_frag = q_regs[q_batch, mfma_k]
         k_frag = k_regs[q_batch, mfma_k]
+        invariant.assert_tag_eq(q_regs[q_batch, mfma_k, 0], k_regs[q_batch, mfma_k, 0])
+        invariant.assert_tag_eq(q_regs[q_batch, mfma_k, 1], k_regs[q_batch, mfma_k, 1])
         score_acc[1] = al.amdgpu.mfma_32x32x8_bf16_f32(k_frag, q_frag, score_acc[1])
     _hot_loop_scheduler_qk_major()
 
@@ -343,6 +354,8 @@ def _gemm_qk_word_regs_batch1_small(
         mfma_k = mfma_idx - q_batch * 2
         q_frag = q_regs[q_batch, mfma_k]
         k_frag = k_regs[q_batch, mfma_k]
+        invariant.assert_tag_eq(q_regs[q_batch, mfma_k, 0], k_regs[q_batch, mfma_k, 0])
+        invariant.assert_tag_eq(q_regs[q_batch, mfma_k, 1], k_regs[q_batch, mfma_k, 1])
         score_acc[1] = al.amdgpu.mfma_32x32x8_bf16_f32(k_frag, q_frag, score_acc[1])
     _hot_loop_scheduler_qk_minor()
 
@@ -620,34 +633,136 @@ def _fetch_v_reg_words_batch_compact(
 
 
 @avelang.jit
+def _pack_gemm_o_score_mfma_batch(
+    packed_score: al.Tensor((16,), al.f32),
+    score_acc: al.Tensor((K_BATCHES, 16), al.f32),
+    k_batch: al.u32,
+    lane_half: al.u32,
+):
+    for elem in al.range(4):
+        lo0 = score_acc[k_batch, elem]
+        lo1 = score_acc[k_batch, 4 + elem]
+        hi0 = score_acc[k_batch, 8 + elem]
+        hi1 = score_acc[k_batch, 12 + elem]
+        partner_lo0 = al.shuffle_xor(lo0, 32, 64)
+        partner_lo1 = al.shuffle_xor(lo1, 32, 64)
+        partner_hi0 = al.shuffle_xor(hi0, 32, 64)
+        partner_hi1 = al.shuffle_xor(hi1, 32, 64)
+        if lane_half == 0:
+            packed_score[elem] = lo0
+            packed_score[4 + elem] = hi0
+            packed_score[8 + elem] = partner_lo0
+            packed_score[12 + elem] = partner_hi0
+        else:
+            packed_score[elem] = partner_lo1
+            packed_score[4 + elem] = partner_hi1
+            packed_score[8 + elem] = lo1
+            packed_score[12 + elem] = hi1
+
+
+@avelang.jit
+def _gemm_o_mfma_v_word_regs_batch_compact(
+    out_acc: al.Tensor((O_BATCHES, 16), al.f32),
+    packed_score: al.Tensor((16,), al.f32),
+    v_regs: al.Tensor((O_BATCHES, 4, 2), al.u32),
+    partition_idx: al.u32,
+    lane_half: al.u32,
+    wtid: al.u32,
+):
+    score_frag = al.make_local((4,), al.bf16)
+    score_words = al.view(score_frag, al.Tensor((2,), al.u32))
+    p_bf16 = al.make_local((4, 4), al.bf16)
+    v_bf16 = al.view(v_regs, al.bf16, al.make_layout((O_BATCHES, 4, 4), (16, 4, 1)))
+    invariant.tag(
+        p_bf16,
+        lambda k_slice, lane: (
+            partition_idx * 128 + (k_slice // 2) * 32 + (k_slice % 2) * 16 + lane_half * 4 + lane,
+            0,
+            wtid % 32,
+        ),
+        "FlashPBF16",
+        lane_half,
+        partition_idx,
+        wtid,
+    )
+    invariant.tag(
+        v_bf16,
+        lambda o_batch, k_slice, lane: (
+            partition_idx * 128 + (k_slice // 2) * 32 + (k_slice % 2) * 16 + lane_half * 4 + lane,
+            0,
+            wtid % 32,
+        ),
+        "FlashVBF16",
+        lane_half,
+        partition_idx,
+        wtid,
+    )
+
+    for o_batch in al.range(O_BATCHES):
+        for k_slice in al.range(4):
+            v_frag_bf16 = al.make_local((4,), al.bf16)
+            v_words = al.view(v_frag_bf16, al.Tensor((2,), al.u32))
+            for elem in al.range(4):
+                p_bf16[k_slice, elem] = al.convert(packed_score[k_slice * 4 + elem], al.bf16)
+                score_frag[elem] = p_bf16[k_slice, elem]
+                v_frag_bf16[elem] = v_bf16[o_batch, k_slice, elem]
+                invariant.assert_tag_eq(score_frag[elem], v_frag_bf16[elem])
+            out_acc[o_batch] = al.amdgpu.mfma_32x32x8_bf16_f32(v_words, score_words, out_acc[o_batch])
+    _hot_loop_scheduler_gemm_o()
+
+
+@avelang.jit
 def _gemm_o_mfma_v_word_regs_batch0_direct(
     out_acc: al.Tensor((O_BATCHES, 16), al.f32),
     score_acc: al.Tensor((K_BATCHES, 16), al.f32),
     v_regs: al.Tensor((O_BATCHES, 4, 2), al.u32),
+    partition_idx: al.u32,
+    lane_half: al.u32,
+    wtid: al.u32,
 ):
     score_frag = al.make_local((4,), al.bf16)
     score_words = al.view(score_frag, al.Tensor((2,), al.u32))
+    p_bf16 = al.make_local((4, 4), al.bf16)
+    v_bf16 = al.view(v_regs, al.bf16, al.make_layout((O_BATCHES, 4, 4), (16, 4, 1)))
+    invariant.tag(p_bf16, lambda k_slice, lane: (partition_idx * 128 + (k_slice // 2) * 32 + (k_slice % 2) * 16 + lane_half * 4 + lane, 0, wtid % 32), "FlashPBF16", lane_half, partition_idx, wtid)
+    invariant.tag(v_bf16, lambda o_batch, k_slice, lane: (partition_idx * 128 + (k_slice // 2) * 32 + (k_slice % 2) * 16 + lane_half * 4 + lane, 0, wtid % 32), "FlashVBF16", lane_half, partition_idx, wtid)
 
     for k_slice in al.range(4):
-        v_frag = v_regs[0, k_slice]
+        v_frag_bf16 = al.make_local((4,), al.bf16)
+        v_words = al.view(v_frag_bf16, al.Tensor((2,), al.u32))
         for elem in al.range(4):
-            score_frag[elem] = al.convert(score_acc[0, k_slice * 4 + elem], al.bf16)
-        out_acc[0] = al.amdgpu.mfma_32x32x8_bf16_f32(v_frag, score_words, out_acc[0])
+            p_bf16[k_slice, elem] = al.convert(score_acc[0, k_slice * 4 + elem], al.bf16)
+            score_frag[elem] = p_bf16[k_slice, elem]
+            v_frag_bf16[elem] = v_bf16[0, k_slice, elem]
+            invariant.assert_tag_eq(score_frag[elem], v_frag_bf16[elem])
+        out_acc[0] = al.amdgpu.mfma_32x32x8_bf16_f32(v_words, score_words, out_acc[0])
     for k_slice in al.range(4):
-        v_frag = v_regs[1, k_slice]
+        v_frag_bf16 = al.make_local((4,), al.bf16)
+        v_words = al.view(v_frag_bf16, al.Tensor((2,), al.u32))
         for elem in al.range(4):
-            score_frag[elem] = al.convert(score_acc[0, k_slice * 4 + elem], al.bf16)
-        out_acc[1] = al.amdgpu.mfma_32x32x8_bf16_f32(v_frag, score_words, out_acc[1])
+            p_bf16[k_slice, elem] = al.convert(score_acc[0, k_slice * 4 + elem], al.bf16)
+            score_frag[elem] = p_bf16[k_slice, elem]
+            v_frag_bf16[elem] = v_bf16[1, k_slice, elem]
+            invariant.assert_tag_eq(score_frag[elem], v_frag_bf16[elem])
+        out_acc[1] = al.amdgpu.mfma_32x32x8_bf16_f32(v_words, score_words, out_acc[1])
     for k_slice in al.range(4):
-        v_frag = v_regs[2, k_slice]
+        v_frag_bf16 = al.make_local((4,), al.bf16)
+        v_words = al.view(v_frag_bf16, al.Tensor((2,), al.u32))
         for elem in al.range(4):
-            score_frag[elem] = al.convert(score_acc[0, k_slice * 4 + elem], al.bf16)
-        out_acc[2] = al.amdgpu.mfma_32x32x8_bf16_f32(v_frag, score_words, out_acc[2])
+            p_bf16[k_slice, elem] = al.convert(score_acc[0, k_slice * 4 + elem], al.bf16)
+            score_frag[elem] = p_bf16[k_slice, elem]
+            v_frag_bf16[elem] = v_bf16[2, k_slice, elem]
+            invariant.assert_tag_eq(score_frag[elem], v_frag_bf16[elem])
+        out_acc[2] = al.amdgpu.mfma_32x32x8_bf16_f32(v_words, score_words, out_acc[2])
     for k_slice in al.range(4):
-        v_frag = v_regs[3, k_slice]
+        v_frag_bf16 = al.make_local((4,), al.bf16)
+        v_words = al.view(v_frag_bf16, al.Tensor((2,), al.u32))
         for elem in al.range(4):
-            score_frag[elem] = al.convert(score_acc[0, k_slice * 4 + elem], al.bf16)
-        out_acc[3] = al.amdgpu.mfma_32x32x8_bf16_f32(v_frag, score_words, out_acc[3])
+            p_bf16[k_slice, elem] = al.convert(score_acc[0, k_slice * 4 + elem], al.bf16)
+            score_frag[elem] = p_bf16[k_slice, elem]
+            v_frag_bf16[elem] = v_bf16[3, k_slice, elem]
+            invariant.assert_tag_eq(score_frag[elem], v_frag_bf16[elem])
+        out_acc[3] = al.amdgpu.mfma_32x32x8_bf16_f32(v_words, score_words, out_acc[3])
     _hot_loop_scheduler_gemm_o()
 
 
@@ -656,31 +771,104 @@ def _gemm_o_mfma_v_word_regs_batch1_direct(
     out_acc: al.Tensor((O_BATCHES, 16), al.f32),
     score_acc: al.Tensor((K_BATCHES, 16), al.f32),
     v_regs: al.Tensor((O_BATCHES, 4, 2), al.u32),
+    partition_idx: al.u32,
+    lane_half: al.u32,
+    wtid: al.u32,
 ):
     score_frag = al.make_local((4,), al.bf16)
     score_words = al.view(score_frag, al.Tensor((2,), al.u32))
+    p_bf16 = al.make_local((4, 4), al.bf16)
+    v_bf16 = al.view(v_regs, al.bf16, al.make_layout((O_BATCHES, 4, 4), (16, 4, 1)))
+    invariant.tag(p_bf16, lambda k_slice, lane: (partition_idx * 128 + (k_slice // 2) * 32 + (k_slice % 2) * 16 + lane_half * 4 + lane, 0, wtid % 32), "FlashPBF16", lane_half, partition_idx, wtid)
+    invariant.tag(v_bf16, lambda o_batch, k_slice, lane: (partition_idx * 128 + (k_slice // 2) * 32 + (k_slice % 2) * 16 + lane_half * 4 + lane, 0, wtid % 32), "FlashVBF16", lane_half, partition_idx, wtid)
 
     for k_slice in al.range(4):
-        v_frag = v_regs[0, k_slice]
+        v_frag_bf16 = al.make_local((4,), al.bf16)
+        v_words = al.view(v_frag_bf16, al.Tensor((2,), al.u32))
         for elem in al.range(4):
-            score_frag[elem] = al.convert(score_acc[1, k_slice * 4 + elem], al.bf16)
-        out_acc[0] = al.amdgpu.mfma_32x32x8_bf16_f32(v_frag, score_words, out_acc[0])
+            p_bf16[k_slice, elem] = al.convert(score_acc[1, k_slice * 4 + elem], al.bf16)
+            score_frag[elem] = p_bf16[k_slice, elem]
+            v_frag_bf16[elem] = v_bf16[0, k_slice, elem]
+            invariant.assert_tag_eq(score_frag[elem], v_frag_bf16[elem])
+        out_acc[0] = al.amdgpu.mfma_32x32x8_bf16_f32(v_words, score_words, out_acc[0])
     for k_slice in al.range(4):
-        v_frag = v_regs[1, k_slice]
+        v_frag_bf16 = al.make_local((4,), al.bf16)
+        v_words = al.view(v_frag_bf16, al.Tensor((2,), al.u32))
         for elem in al.range(4):
-            score_frag[elem] = al.convert(score_acc[1, k_slice * 4 + elem], al.bf16)
-        out_acc[1] = al.amdgpu.mfma_32x32x8_bf16_f32(v_frag, score_words, out_acc[1])
+            p_bf16[k_slice, elem] = al.convert(score_acc[1, k_slice * 4 + elem], al.bf16)
+            score_frag[elem] = p_bf16[k_slice, elem]
+            v_frag_bf16[elem] = v_bf16[1, k_slice, elem]
+            invariant.assert_tag_eq(score_frag[elem], v_frag_bf16[elem])
+        out_acc[1] = al.amdgpu.mfma_32x32x8_bf16_f32(v_words, score_words, out_acc[1])
     for k_slice in al.range(4):
-        v_frag = v_regs[2, k_slice]
+        v_frag_bf16 = al.make_local((4,), al.bf16)
+        v_words = al.view(v_frag_bf16, al.Tensor((2,), al.u32))
         for elem in al.range(4):
-            score_frag[elem] = al.convert(score_acc[1, k_slice * 4 + elem], al.bf16)
-        out_acc[2] = al.amdgpu.mfma_32x32x8_bf16_f32(v_frag, score_words, out_acc[2])
+            p_bf16[k_slice, elem] = al.convert(score_acc[1, k_slice * 4 + elem], al.bf16)
+            score_frag[elem] = p_bf16[k_slice, elem]
+            v_frag_bf16[elem] = v_bf16[2, k_slice, elem]
+            invariant.assert_tag_eq(score_frag[elem], v_frag_bf16[elem])
+        out_acc[2] = al.amdgpu.mfma_32x32x8_bf16_f32(v_words, score_words, out_acc[2])
     for k_slice in al.range(4):
-        v_frag = v_regs[3, k_slice]
+        v_frag_bf16 = al.make_local((4,), al.bf16)
+        v_words = al.view(v_frag_bf16, al.Tensor((2,), al.u32))
         for elem in al.range(4):
-            score_frag[elem] = al.convert(score_acc[1, k_slice * 4 + elem], al.bf16)
-        out_acc[3] = al.amdgpu.mfma_32x32x8_bf16_f32(v_frag, score_words, out_acc[3])
+            p_bf16[k_slice, elem] = al.convert(score_acc[1, k_slice * 4 + elem], al.bf16)
+            score_frag[elem] = p_bf16[k_slice, elem]
+            v_frag_bf16[elem] = v_bf16[3, k_slice, elem]
+            invariant.assert_tag_eq(score_frag[elem], v_frag_bf16[elem])
+        out_acc[3] = al.amdgpu.mfma_32x32x8_bf16_f32(v_words, score_words, out_acc[3])
     _hot_loop_scheduler_gemm_o()
+
+
+@avelang.jit
+def _flash_attn_update_o_batch(
+    score_acc: al.Tensor((K_BATCHES, 16), al.f32),
+    out_acc: al.Tensor((O_BATCHES, 16), al.f32),
+    v_regs: al.Tensor((O_BATCHES, 4, 2), al.u32),
+    softmax_state: al.Tensor((2,), al.f32),
+    k_batch: al.u32,
+    partition_idx: al.u32,
+    lane_half: al.u32,
+    wtid: al.u32,
+    scale_log2: al.f32,
+) -> (al.f32, al.f32):
+    zero_f32 = al.convert(0.0, al.f32)
+    mi = softmax_state[0]
+    l = softmax_state[1]
+    block_max = _compute_row_max_batch(score_acc, k_batch)
+    mi_new = block_max
+    if partition_idx != 0:
+        if (block_max - mi) * scale_log2 <= al.convert(8.0, al.f32):
+            mi_new = mi
+        elif mi > block_max:
+            mi_new = mi
+    if block_max <= al.convert(NEG_INF, al.f32):
+        if partition_idx == 0:
+            mi_new = zero_f32
+        else:
+            mi_new = mi
+
+    local_sum = _compute_ptilde_and_row_sum_batch(score_acc, k_batch, mi_new, scale_log2)
+    row_sum = local_sum
+    if partition_idx == 0:
+        l = row_sum
+    else:
+        if (block_max - mi) * scale_log2 <= al.convert(8.0, al.f32):
+            l = l + row_sum
+        else:
+            scaling = al.exp2((mi - mi_new) * scale_log2)
+            l = al.fma(scaling, l, row_sum)
+            _multiply_alpha_o_mfma(scaling, out_acc)
+    mi = mi_new
+
+    _pack_gemm_o_score_mfma_batch(score_acc_mfma, score_acc, k_batch, lane_half)
+    _gemm_o_mfma_v_word_regs_batch_compact(
+        out_acc, score_acc_mfma, v_regs, partition_idx, lane_half, wtid
+    )
+    softmax_state[0] = mi
+    softmax_state[1] = l
+    return mi, l
 
 
 @avelang.jit
@@ -718,7 +906,9 @@ def _flash_attn_update_o_batch0(
         _multiply_alpha_o_mfma(scaling, out_acc)
     mi = mi_new
 
-    _gemm_o_mfma_v_word_regs_batch0_direct(out_acc, score_acc, v_regs)
+    _gemm_o_mfma_v_word_regs_batch0_direct(
+        out_acc, score_acc, v_regs, partition_idx, lane_half, wtid
+    )
     softmax_state[0] = mi
     softmax_state[1] = l
     return mi, l
@@ -759,7 +949,9 @@ def _flash_attn_update_o_batch1(
         _multiply_alpha_o_mfma(scaling, out_acc)
     mi = mi_new
 
-    _gemm_o_mfma_v_word_regs_batch1_direct(out_acc, score_acc, v_regs)
+    _gemm_o_mfma_v_word_regs_batch1_direct(
+        out_acc, score_acc, v_regs, partition_idx, lane_half, wtid
+    )
     softmax_state[0] = mi
     softmax_state[1] = l
     return mi, l
@@ -1529,13 +1721,17 @@ def _flash_attn_packed_drain_epilogue(
         _store_v_global_slice_packed(work_words, g_v1, wid, wtid, 1)
         al.syncthreads()
         _fetch_v_reg_words_batch_compact(v_regs, v_words, key_row_local, wtid, 1)
-        _gemm_o_mfma_v_word_regs_batch1_direct(out_acc, score_acc, v_regs)
+        _gemm_o_mfma_v_word_regs_batch1_direct(
+            out_acc, score_acc, v_regs, max_k_slice, lane_half, wtid
+        )
     if not epilogue_uses_s1:
         al.amdgpu.s_waitcnt(0, 7, 15)
         _store_v_global_slice_packed(work_words, g_v0, wid, wtid, 0)
         al.syncthreads()
         _fetch_v_reg_words_batch_compact(v_regs, v_words, key_row_local, wtid, 0)
-        _gemm_o_mfma_v_word_regs_batch0_direct(out_acc, score_acc, v_regs)
+        _gemm_o_mfma_v_word_regs_batch0_direct(
+            out_acc, score_acc, v_regs, max_k_slice, lane_half, wtid
+        )
 
 
 @avelang.jit
@@ -2037,6 +2233,36 @@ def _flash_attn_packed_kernel(
     q_flat = al.make_tensor(q_ptr, al.bf16, al.make_layout((q_elems,), (1,)))
     k_flat = al.make_tensor(k_ptr, al.bf16, al.make_layout((kv_elems,), (1,)))
     v_flat = al.make_tensor(v_ptr, al.bf16, al.make_layout((kv_elems,), (1,)))
+    # Figure 1 source tags, expressed against the physical packed tensors.
+    # Q/K share the 32-row MFMA tile coordinate; V is keyed by its source row
+    # and the 32-element output-dimension slice.
+    invariant.tag(
+        q_flat,
+        lambda element: (
+            (element // 1024) % 32,
+            ((element // 128) % 8) // 8,
+            element % 128,
+        ),
+        "FlashQ",
+    )
+    invariant.tag(
+        k_flat,
+        lambda element: (
+            (element // 128) % 32,
+            (element // 128) % 1,
+            element % 128,
+        ),
+        "FlashK",
+    )
+    invariant.tag(
+        v_flat,
+        lambda element: (
+            element // 128,
+            (element // 128) % 1,
+            element % 32,
+        ),
+        "FlashV",
+    )
 
     q_head_idx = physical_q_head_idx
     head_idx_q = physical_q_tile_idx
