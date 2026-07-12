@@ -254,6 +254,16 @@ class DependenciesFinder(ast.NodeVisitor):
             self._update_hash(val)
             return
 
+        # Invariant helpers are compiler-recognized DSL builtins.  They are
+        # intentionally Python stubs (like the other language intrinsics), so
+        # they must not be treated as ordinary host callables during dependency
+        # collection for a JIT kernel.
+        if getattr(val, "__module__", "") in {
+            "avelang.invariant",
+            "avelang.language.invariant",
+        }:
+            return
+
         if callable(val) and not isinstance(val, type) and not isinstance(val, constexpr):
             raise RuntimeError(
                 f"Unsupported function referenced: {val}. Functions called from @avelang.jit "
@@ -675,6 +685,9 @@ class KernelParam:
 
 
 def compute_cache_key(kernel_key_cache, specialization, options):
+    # `options` is the normalized backend options object.  It must be part of
+    # both cache layers because it controls code generation (notably invariant
+    # validation) even when launch arguments are identical.
     key = (tuple(specialization), str(options))
     cache_key = kernel_key_cache.get(key, None)
     if cache_key is not None:
@@ -809,10 +822,6 @@ class JITFunction(JITCallable, KernelInterface[T]):
 
         # Kernel is not cached; we have to compile.
         if kernel is None:
-            options, signature, constexprs, global_constexprs, attrs = self._pack_args(
-                backend, kwargs, bound_args, specialization, options
-            )
-
             kernel = self._do_compile(key, signature, device, constexprs, global_constexprs, options, attrs)
             if kernel is None:
                 raise RuntimeError(f"Kernel compilation failed for {self.__name__}")

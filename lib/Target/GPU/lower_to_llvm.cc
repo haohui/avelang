@@ -3,6 +3,7 @@
 #include "Dialect/AveLang/Transforms/allocation_op_interface_impl.h"
 #include "Dialect/AveLang/Transforms/hoist_alloca_pass.h"
 #include "Dialect/AveLang/Transforms/lower_ave_lang_to_memref_pass.h"
+#include "Analysis/validate_invariant_tags_pass.h"
 #include "Dialect/AveLang/Transforms/lower_gpuop_to_intrinsics_pass.h"
 #include "IR/builtin_module.h"
 #include "IR/ir_context.h"
@@ -157,6 +158,9 @@ class LowerToLLVM::Impl {
         }
 
         PassManager pm(ir_context_->GetMLIRContext());
+
+        pm.addNestedPass<mlir::func::FuncOp>(
+            causalflow::avelang::analysis::createValidateInvariantTagsPass());
 
         pm.addPass(causalflow::avelang::dialect::
                        createLowerAveLangGPUToIntrinsicsPass());

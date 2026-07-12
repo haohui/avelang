@@ -30,6 +30,7 @@ target_link_libraries(ave-lang-target-amdgpu
   MLIRGPUToROCDLTransforms
   MLIRMemRefTransforms
   ave-lang-mlir
+  ave-lang-analysis
   ave-lang-dialect-transforms
   LLVMAMDGPUCodeGen
   LLVMAMDGPUInfo

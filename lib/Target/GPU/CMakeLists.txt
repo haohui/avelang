@@ -32,6 +32,7 @@ target_link_libraries(ave-lang-target-gpu
   MLIRAffineDialect
   MLIRPass
   ave-lang-mlir
+  ave-lang-analysis
   ave-lang-dialect-transforms
 )
 

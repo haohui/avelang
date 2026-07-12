@@ -6,6 +6,7 @@ A Python framework for writing high-performance GPU kernels with JIT compilation
 
 from . import amdgpu as amdgpu
 from . import nvvm as nvvm
+from . import invariant as invariant
 from .core import (
     # Signed integer types
     i8,
@@ -54,6 +55,7 @@ __all__ = [
     # Target-specific intrinsic modules
     "amdgpu",
     "nvvm",
+    "invariant",
     # Signed integer types
     "i8",
     "i16",

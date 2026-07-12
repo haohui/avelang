@@ -23,12 +23,142 @@
 #include <mlir/IR/BuiltinAttributes.h>
 #include <mlir/IR/BuiltinOps.h>
 #include <mlir/IR/BuiltinTypes.h>
+#include <set>
 #include <tuple>
 
 namespace causalflow::avelang::ir {
 
 using namespace mlir;
 namespace cf = causalflow::avelang::dialect;
+
+namespace {
+
+class InvariantModule : public NamedModule {
+  public:
+    explicit InvariantModule(AveLangModule *parent)
+        : NamedModule("invariant"), parent_(parent) {}
+
+    void Initialize() override {
+        AddFunction(
+            "tag",
+            [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+                   llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+                return parent_->CreateTagBindFunction(call_expr, gen_ctx,
+                                                      resolved_args);
+            });
+        AddFunction(
+            "assert_tag_eq",
+            [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+                   llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+                return parent_->CreateTagAssertEqFunction(call_expr, gen_ctx,
+                                                          resolved_args);
+            });
+        AddFunction(
+            "reset_tags",
+            [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+                   llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+                return parent_->CreateTagResetFunction(call_expr, gen_ctx,
+                                                       resolved_args);
+            });
+    }
+
+  private:
+    AveLangModule *parent_;
+};
+
+static bool parseIntConstantString(const std::string &value, int64_t &out) {
+    auto trimmed = llvm::StringRef(value).trim();
+    return !trimmed.getAsInteger(10, out);
+}
+
+static std::optional<std::string>
+serializeTagExpr(ast::Expr *expr, const std::set<std::string> &allowedNames,
+                 std::set<std::string> &captureNames) {
+    if (!expr) {
+        return std::nullopt;
+    }
+
+    if (auto *name = llvm::dyn_cast<ast::Name>(expr)) {
+        if (!allowedNames.contains(name->GetId())) captureNames.insert(name->GetId());
+        return name->GetId();
+    }
+
+    if (auto *constant = llvm::dyn_cast<ast::Constant>(expr)) {
+        int64_t ignored = 0;
+        if (!parseIntConstantString(constant->GetValue(), ignored)) {
+            return std::nullopt;
+        }
+        return constant->GetValue();
+    }
+
+    if (auto *binop = llvm::dyn_cast<ast::BinOp>(expr)) {
+        auto lhs = serializeTagExpr(binop->GetLeft(), allowedNames, captureNames);
+        auto rhs = serializeTagExpr(binop->GetRight(), allowedNames, captureNames);
+        if (!lhs || !rhs) {
+            return std::nullopt;
+        }
+
+        llvm::StringRef op = binop->GetOp();
+        if (op != "Add" && op != "Sub" && op != "FloorDiv" && op != "Mod" &&
+            op != "Mult") {
+            return std::nullopt;
+        }
+        return "(" + op.lower() + " " + *lhs + " " + *rhs + ")";
+    }
+
+    if (auto *unaryop = llvm::dyn_cast<ast::UnaryOp>(expr)) {
+        auto operand = serializeTagExpr(unaryop->GetOperand(), allowedNames,
+                                        captureNames);
+        if (!operand || unaryop->GetOp() != "USub") {
+            return std::nullopt;
+        }
+        return "(- " + *operand + ")";
+    }
+
+    return std::nullopt;
+}
+
+static std::optional<mlir::ArrayAttr>
+serializeTagLambda(ast::Lambda *lambda, mlir::OpBuilder &builder,
+                   llvm::SmallVectorImpl<std::string> &inputNames,
+                   llvm::SmallVectorImpl<std::string> &captureNames) {
+    if (!lambda || !lambda->GetArgs()) {
+        return std::nullopt;
+    }
+
+    auto *args = lambda->GetArgs();
+    if (!args->GetPosOnlyArgs().empty() || !args->GetKwOnlyArgs().empty() ||
+        args->GetVarArg() || args->GetKwArg()) {
+        return std::nullopt;
+    }
+
+    std::set<std::string> lambdaArgs;
+    for (auto *arg : args->GetArgs()) {
+        inputNames.push_back(arg->GetArgName());
+        lambdaArgs.insert(arg->GetArgName());
+    }
+
+    auto *bodyTuple = llvm::dyn_cast<ast::Tuple>(lambda->GetBody());
+    if (!bodyTuple || bodyTuple->GetElts().empty()) {
+        return std::nullopt;
+    }
+
+    llvm::SmallVector<mlir::Attribute> exprAttrs;
+    std::set<std::string> captures;
+    for (auto *elt : bodyTuple->GetElts()) {
+        auto serialized = serializeTagExpr(elt, lambdaArgs, captures);
+        if (!serialized) {
+            return std::nullopt;
+        }
+        exprAttrs.push_back(builder.getStringAttr(*serialized));
+    }
+
+    captureNames.append(captures.begin(), captures.end());
+
+    return builder.getArrayAttr(exprAttrs);
+}
+
+} // namespace
 
 // Helper function to generate row-major stride tuples matching nested structure
 static void
@@ -796,6 +926,9 @@ void AveLangModule::Initialize() {
     // Mirror Python package structure: expose DSL constructs under
     // avelang.language in addition to the root module.
     AddModule("language", this);
+    invariant_module_ = std::make_unique<InvariantModule>(this);
+    invariant_module_->Initialize();
+    AddModule("invariant", invariant_module_.get());
 
     // Register NVVM intrinsic module as a submodule
     nvvm_module_ = CreateNVVMIntrinsicModule();
@@ -2167,6 +2300,150 @@ mlir::Value AveLangModule::CreateViewFunction(
     }
 
     return castOp.getResult();
+}
+
+mlir::Value AveLangModule::CreateTagBindFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    if (!call_expr || resolved_args.empty() || !resolved_args[0]) {
+        return nullptr;
+    }
+
+    const auto &args = call_expr->GetArgs();
+    if (args.size() < 2 || resolved_args.size() != args.size()) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "invariant.tag expects (target, lambda[, name[, captures...]])";
+        return nullptr;
+    }
+
+    auto target = resolved_args[0];
+    auto targetType = mlir::dyn_cast<cf::MemRefType>(target.getType());
+    if (!targetType) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "invariant.tag target must be a tensor or tile value";
+        return nullptr;
+    }
+
+    auto *lambda = llvm::dyn_cast<ast::Lambda>(args[1]);
+    if (!lambda) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "invariant.tag requires a lambda as its second argument";
+        return nullptr;
+    }
+
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    llvm::SmallVector<std::string> inputNames;
+    llvm::SmallVector<std::string> captureNames;
+    auto exprs = serializeTagLambda(lambda, builder, inputNames, captureNames);
+    if (!exprs) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "unsupported invariant.tag lambda body";
+        return nullptr;
+    }
+
+    if (static_cast<int64_t>(inputNames.size()) != targetType.getRank()) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "invariant.tag lambda arity must match target rank";
+        return nullptr;
+    }
+
+    mlir::StringAttr tagNameAttr;
+    llvm::SmallVector<mlir::Value> captureValues;
+    if (args.size() >= 3) {
+        auto *nameConst = llvm::dyn_cast<ast::Constant>(args[2]);
+        if (!nameConst) {
+            ctx->diagnostic_manager->Report(
+                basic::DiagnosticCode::kUnimplemented,
+                call_expr->GetSourceRange().getBegin())
+                << "invariant.tag name must be a string literal";
+            return nullptr;
+        }
+        tagNameAttr = builder.getStringAttr(nameConst->GetValue());
+
+        if (args.size() - 3 != captureNames.size()) {
+            ctx->diagnostic_manager->Report(
+                basic::DiagnosticCode::kUnimplemented,
+                call_expr->GetSourceRange().getBegin())
+                << "invariant.tag capture arguments must match the free names "
+                   "in the tag lambda";
+            return nullptr;
+        }
+        for (auto [captureArg, captureName, captureValue] :
+             llvm::zip(llvm::ArrayRef<ast::Expr *>(args).drop_front(3), captureNames,
+                       resolved_args.drop_front(3))) {
+            auto *capture = llvm::dyn_cast<ast::Name>(captureArg);
+            if (!capture || capture->GetId() != captureName || !captureValue) {
+                ctx->diagnostic_manager->Report(
+                    basic::DiagnosticCode::kUnimplemented,
+                    call_expr->GetSourceRange().getBegin())
+                    << "invariant.tag captures must be named values matching "
+                       "the tag lambda's free names";
+                return nullptr;
+            }
+            captureValues.push_back(captureValue);
+        }
+    } else if (!captureNames.empty()) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "invariant.tag with captured names requires a tag name followed "
+               "by matching capture arguments";
+        return nullptr;
+    }
+
+    llvm::SmallVector<mlir::Attribute> inputAttrs;
+    inputAttrs.reserve(inputNames.size());
+    for (const auto &name : inputNames) {
+        inputAttrs.push_back(builder.getStringAttr(name));
+    }
+
+    llvm::SmallVector<mlir::Attribute> captureAttrs;
+    captureAttrs.reserve(captureNames.size());
+    for (const auto &name : captureNames)
+        captureAttrs.push_back(builder.getStringAttr(name));
+
+    builder.create<cf::TagBindOp>(
+        GetCallLocation(ctx, call_expr), target, captureValues, tagNameAttr,
+        builder.getArrayAttr(inputAttrs), builder.getArrayAttr(captureAttrs),
+        *exprs);
+    return ctx->GetCurrentFunctionGenerator()
+        ->GetExprGenerator()
+        ->CreateVoidValue();
+}
+
+mlir::Value AveLangModule::CreateTagAssertEqFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    if (!call_expr || resolved_args.size() != 2 || !resolved_args[0] ||
+        !resolved_args[1]) {
+        return nullptr;
+    }
+
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    builder.create<cf::TagAssertEqOp>(GetCallLocation(ctx, call_expr),
+                                      resolved_args[0], resolved_args[1]);
+    return ctx->GetCurrentFunctionGenerator()
+        ->GetExprGenerator()
+        ->CreateVoidValue();
+}
+
+mlir::Value AveLangModule::CreateTagResetFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    if (!call_expr || resolved_args.size() != 1 || !resolved_args[0]) {
+        return nullptr;
+    }
+
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    builder.create<cf::TagResetOp>(GetCallLocation(ctx, call_expr),
+                                   resolved_args[0]);
+    return ctx->GetCurrentFunctionGenerator()
+        ->GetExprGenerator()
+        ->CreateVoidValue();
 }
 
 } // namespace causalflow::avelang::ir

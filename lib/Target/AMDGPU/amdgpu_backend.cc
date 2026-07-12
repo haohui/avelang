@@ -36,6 +36,7 @@ void AMDGPUBackend::buildLoweringPipeline(
     amdgpuOptions.triple = options.triple.str();
     amdgpuOptions.optimization_level = options.optimization_level;
     amdgpuOptions.num_warps = options.num_warps;
+    amdgpuOptions.validate_invariants = options.validate_invariants;
     amdgpuOptions.use_bare_ptr_memref_call_conv =
         options.use_bare_ptr_memref_call_conv;
     amdgpuOptions.target_features = options.target_features;

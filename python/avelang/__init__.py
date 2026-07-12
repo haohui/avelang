@@ -1,8 +1,9 @@
-from . import language
+from . import invariant, language
 from .runtime.jit import jit
 
 __all__ = [
     "jit",
+    "invariant",
     "language",
 ]
 

@@ -1,6 +1,7 @@
 #include "AveLangOps.h"
 #include "AveLangDialect.h"
 #include "IR/Intrinsics/amdgpu_mfma_signatures.h"
+#include <mlir/Dialect/MemRef/IR/MemRef.h>
 #include <mlir/Dialect/LLVMIR/LLVMDialect.h>
 #include <mlir/Dialect/Ptr/IR/PtrTypes.h>
 #include <mlir/Dialect/Vector/IR/VectorOps.h>
@@ -15,6 +16,10 @@ namespace amdgpu_mfma = causalflow::avelang::amdgpu::mfma;
 
 static bool isAveLangMemRefType(mlir::Type type) {
     return mlir::isa<MemRefType>(type);
+}
+
+static bool isAnyMemRefLikeType(mlir::Type type) {
+    return mlir::isa<MemRefType, mlir::MemRefType>(type);
 }
 
 namespace {
@@ -216,6 +221,33 @@ void MakeIntTupleOp::build(mlir::OpBuilder &builder,
 mlir::LogicalResult MakeIntTupleOp::verify() {
     // This operation also carries Python tuple values for multi-result calls.
     // Shape/layout consumers validate their integer-only requirements.
+    return mlir::success();
+}
+
+mlir::LogicalResult TagBindOp::verify() {
+    if (!isAnyMemRefLikeType(getTarget().getType()))
+        return emitOpError("target must be a memref-like value");
+    if (getTagInputs().empty() || getTagExprs().empty())
+        return emitOpError("tag_inputs and tag_exprs must not be empty");
+    int64_t rank = mlir::isa<MemRefType>(getTarget().getType())
+                       ? mlir::cast<MemRefType>(getTarget().getType()).getRank()
+                       : mlir::cast<mlir::MemRefType>(getTarget().getType()).getRank();
+    if (static_cast<int64_t>(getTagInputs().size()) != rank)
+        return emitOpError("tag input arity must match target rank");
+    return mlir::success();
+}
+
+mlir::LogicalResult TagAssertEqOp::verify() {
+    if (getLhs().getType() != getRhs().getType())
+        return emitOpError("lhs and rhs must have the same type");
+    if (isAnyMemRefLikeType(getLhs().getType()))
+        return emitOpError("tag equality must compare loaded values, not memrefs");
+    return mlir::success();
+}
+
+mlir::LogicalResult TagResetOp::verify() {
+    if (!isAnyMemRefLikeType(getTarget().getType()))
+        return emitOpError("target must be a memref-like value");
     return mlir::success();
 }
 

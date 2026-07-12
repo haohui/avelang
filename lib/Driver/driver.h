@@ -45,6 +45,9 @@ struct CompilationOptions {
     /// Number of warps (or waves) requested by the frontend. -1 means unset.
     int NumWarps = -1;
 
+    /// Run compile-time data-flow invariant proofs.
+    bool ValidateInvariants = false;
+
     /// Use bare pointer calling convention for memref
     bool UseBarePointerCallConv = true;
 
