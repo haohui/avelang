@@ -14,6 +14,7 @@ GROUP_N = 256
 GROUP_DIM = 256
 NUM_WARPS = 4
 THREADS = WARP_SIZE * NUM_WARPS
+SPLIT_K_PER_CTA = 2
 SCALE_BLOCK_SIZE = 128
 TOKEN_BATCH = 8
 SUBGROUP_SIZE = 16
@@ -1007,6 +1008,96 @@ def _stage2(
 
 
 @avelang.jit
+def _stage2_pair_simple(
+    out_bf16: S.Tensor((2,), S.bf16),
+    shm_ret: S.Tensor((RET_DWORDS,), S.u32),
+    quant_h0: S.Tensor((8, 4), S.u32),
+    dq_act0: S.Tensor((4,), S.f32),
+    quant_h1: S.Tensor((8, 4), S.u32),
+    dq_act1: S.Tensor((4,), S.f32),
+    sorted_weights: S.Tensor((2,), S.f32),
+    invalid_token_mask: S.u32,
+    tokens: S.Tensor((TOKEN_BATCH,), S.u32),
+    num_tokens: S.u32,
+    tid: S.u32,
+    wid: S.u32,
+    wtid: S.u32,
+    dim: S.u32,
+    inter_dim: S.u32,
+    w2_rsrc: S.Tensor((4,), S.u32),
+    w2_scale_rsrc: S.Tensor((4,), S.u32),
+    w2_base_value_offset_bytes0: S.u32,
+    w2_base_scale_offset_bytes0: S.u32,
+    w2_base_value_offset_bytes1: S.u32,
+    w2_base_scale_offset_bytes1: S.u32,
+):
+    stage2_iters = (dim + GROUP_N - 1) // GROUP_N
+    w2_value_offset_bytes0 = w2_base_value_offset_bytes0
+    w2_scale_offset_bytes0 = w2_base_scale_offset_bytes0
+    w2_value_offset_bytes1 = w2_base_value_offset_bytes1
+    w2_scale_offset_bytes1 = w2_base_scale_offset_bytes1
+    for iter_idx in S.range(stage2_iters):
+        tile_d = iter_idx * GROUP_N
+        S.syncthreads()
+
+        w2_0_stage0 = S.make_local((8, 4), S.u32)
+        w2_0_stage1 = S.make_local((8, 4), S.u32)
+        w2_1_stage0 = S.make_local((8, 4), S.u32)
+        w2_1_stage1 = S.make_local((8, 4), S.u32)
+        _w2_load_tile_stage0(
+            w2_0_stage0, w2_rsrc, w2_value_offset_bytes0, inter_dim, wid, wtid
+        )
+        _w2_load_tile_stage1(
+            w2_0_stage1, w2_rsrc, w2_value_offset_bytes0, inter_dim, wid, wtid
+        )
+        scale_w2_0 = _w2_load_scale(
+            w2_scale_rsrc, inter_dim, tid, w2_scale_offset_bytes0
+        )
+        _w2_load_tile_stage0(
+            w2_1_stage0, w2_rsrc, w2_value_offset_bytes1, inter_dim, wid, wtid
+        )
+        _w2_load_tile_stage1(
+            w2_1_stage1, w2_rsrc, w2_value_offset_bytes1, inter_dim, wid, wtid
+        )
+        scale_w2_1 = _w2_load_scale(
+            w2_scale_rsrc, inter_dim, tid, w2_scale_offset_bytes1
+        )
+        w2_value_offset_bytes0 = w2_value_offset_bytes0 + inter_dim * GROUP_N
+        w2_scale_offset_bytes0 = w2_scale_offset_bytes0 + (inter_dim // SCALE_BLOCK_SIZE) * 8
+        w2_value_offset_bytes1 = w2_value_offset_bytes1 + inter_dim * GROUP_N
+        w2_scale_offset_bytes1 = w2_scale_offset_bytes1 + (inter_dim // SCALE_BLOCK_SIZE) * 8
+
+        S.amdgpu.s_waitcnt(0, -1, -1)
+        t = S.make_local((8, 4), S.f32)
+        _clear_f32x4_matrix(t)
+        _matmul_stage0(t, w2_0_stage0, quant_h0, dq_act0, scale_w2_0)
+        _matmul_stage1(t, w2_0_stage1, quant_h0, dq_act0, scale_w2_0)
+        _matmul_stage0(t, w2_1_stage0, quant_h1, dq_act1, scale_w2_1)
+        _matmul_stage1(t, w2_1_stage1, quant_h1, dq_act1, scale_w2_1)
+
+        _multiply_route_weights(t, sorted_weights)
+        packed = S.make_local((8, 2), S.u32)
+        for i in S.range(8):
+            _to_bf16_rn(packed[i], t[i])
+
+        _stage2_write_shm(shm_ret, packed, wid, wtid)
+        S.syncthreads()
+        ret = S.make_local((8, 2), S.u32)
+        _stage2_read_shm(ret, shm_ret, wid, wtid)
+        _stage2_write_back(
+            out_bf16,
+            ret,
+            invalid_token_mask,
+            tokens,
+            num_tokens,
+            dim,
+            tile_d,
+            wid,
+            wtid,
+        )
+
+
+@avelang.jit
 def _fused_moe_blockscale_fp8_kernel(
     out_ptr: S.Pointer(S.bf16),
     act_ptr: S.Pointer(S.u8),
@@ -1030,7 +1121,7 @@ def _fused_moe_blockscale_fp8_kernel(
     n_blocks = dim // SCALE_BLOCK_SIZE
     k_blocks = inter_dim // SCALE_BLOCK_SIZE
     tid = S.thread_id(0)
-    tile_k = S.block_id(0)
+    tile_k = S.block_id(0) * SPLIT_K_PER_CTA
     route_group_begin = S.block_id(1)
     wid = tid // WARP_SIZE
     wid_route = S.amdgpu.readfirstlane(wid)
@@ -1121,26 +1212,27 @@ def _fused_moe_blockscale_fp8_kernel(
                 sorted_weights, sorted_weights_rsrc, tid, route_base
             )
 
-            w1_value_offset_bytes = (
+            tile_k1 = tile_k + 1
+            w1_value_offset_bytes0 = (
                 expert_id * (2 * inter_dim * dim) + tile_k * GROUP_DIM * dim
             )
-            w1_scale_offset_bytes = (
+            w1_scale_offset_bytes0 = (
                 expert_id * (2 * k_blocks * n_blocks)
                 + tile_k * (GROUP_DIM // SCALE_BLOCK_SIZE) * n_blocks
             ) * 4
-            w3_value_offset_bytes = w1_value_offset_bytes + inter_dim * dim
-            w3_scale_offset_bytes = w1_scale_offset_bytes + k_blocks * n_blocks * 4
-            w2_value_offset_bytes = (
+            w3_value_offset_bytes0 = w1_value_offset_bytes0 + inter_dim * dim
+            w3_scale_offset_bytes0 = w1_scale_offset_bytes0 + k_blocks * n_blocks * 4
+            w2_value_offset_bytes0 = (
                 expert_id * (dim * inter_dim) + tile_k * (GROUP_DIM * 16)
             )
-            w2_scale_offset_bytes = (
+            w2_scale_offset_bytes0 = (
                 expert_id * (n_blocks * k_blocks)
                 + tile_k * (GROUP_DIM // SCALE_BLOCK_SIZE)
             ) * 4
 
-            h = S.make_local((8, 4), S.f32)
+            h0 = S.make_local((8, 4), S.f32)
             _stage1(
-                h,
+                h0,
                 shared_words,
                 wid,
                 wtid,
@@ -1156,25 +1248,74 @@ def _fused_moe_blockscale_fp8_kernel(
                 w13_rsrc_all,
                 scale_w13_rsrc_all,
                 scale_w13_rsrc_all,
-                w1_value_offset_bytes,
-                w1_scale_offset_bytes,
-                w3_value_offset_bytes,
-                w3_scale_offset_bytes,
+                w1_value_offset_bytes0,
+                w1_scale_offset_bytes0,
+                w3_value_offset_bytes0,
+                w3_scale_offset_bytes0,
             )
             S.syncthreads()
 
-            quant_h = S.make_local((8, 4), S.u32)
-            dq_act = S.make_local((4,), S.f32)
+            quant_h0 = S.make_local((8, 4), S.u32)
+            dq_act0 = S.make_local((4,), S.f32)
             _quantize_and_shuffle(
-                quant_h, dq_act, shm_max, shm_q_h, tid, wid, wtid, h
+                quant_h0, dq_act0, shm_max, shm_q_h, tid, wid, wtid, h0
             )
 
-            _stage2(
+            w1_value_offset_bytes1 = (
+                expert_id * (2 * inter_dim * dim) + tile_k1 * GROUP_DIM * dim
+            )
+            w1_scale_offset_bytes1 = (
+                expert_id * (2 * k_blocks * n_blocks)
+                + tile_k1 * (GROUP_DIM // SCALE_BLOCK_SIZE) * n_blocks
+            ) * 4
+            w3_value_offset_bytes1 = w1_value_offset_bytes1 + inter_dim * dim
+            w3_scale_offset_bytes1 = w1_scale_offset_bytes1 + k_blocks * n_blocks * 4
+            w2_value_offset_bytes1 = (
+                expert_id * (dim * inter_dim) + tile_k1 * (GROUP_DIM * 16)
+            )
+            w2_scale_offset_bytes1 = (
+                expert_id * (n_blocks * k_blocks)
+                + tile_k1 * (GROUP_DIM // SCALE_BLOCK_SIZE)
+            ) * 4
+
+            h1 = S.make_local((8, 4), S.f32)
+            _stage1(
+                h1,
+                shared_words,
+                wid,
+                wtid,
+                tid,
+                token_select_x,
+                token_select_y,
+                tokens,
+                m,
+                dim,
+                act_rsrc,
+                scale_act_rsrc,
+                w13_rsrc_all,
+                w13_rsrc_all,
+                scale_w13_rsrc_all,
+                scale_w13_rsrc_all,
+                w1_value_offset_bytes1,
+                w1_scale_offset_bytes1,
+                w3_value_offset_bytes1,
+                w3_scale_offset_bytes1,
+            )
+            S.syncthreads()
+
+            quant_h1 = S.make_local((8, 4), S.u32)
+            dq_act1 = S.make_local((4,), S.f32)
+            _quantize_and_shuffle(
+                quant_h1, dq_act1, shm_max, shm_q_h, tid, wid, wtid, h1
+            )
+
+            _stage2_pair_simple(
                 out_bf16,
                 shm_ret0,
-                shm_ret1,
-                quant_h,
-                dq_act,
+                quant_h0,
+                dq_act0,
+                quant_h1,
+                dq_act1,
                 sorted_weights,
                 invalid_token_mask,
                 tokens,
@@ -1186,8 +1327,10 @@ def _fused_moe_blockscale_fp8_kernel(
                 inter_dim,
                 w2_rsrc_all,
                 scale_w2_rsrc_all,
-                w2_value_offset_bytes,
-                w2_scale_offset_bytes,
+                w2_value_offset_bytes0,
+                w2_scale_offset_bytes0,
+                w2_value_offset_bytes1,
+                w2_scale_offset_bytes1,
             )
         S.syncthreads()
 
@@ -1237,6 +1380,12 @@ def _validate_fused_moe_fp8_blockscale_inputs(
         )
     if dim == 0 or inter_dim == 0 or dim % SCALE_BLOCK_SIZE != 0 or inter_dim % SCALE_BLOCK_SIZE != 0:
         raise ValueError(f"dim and inter_dim must be nonzero multiples of {SCALE_BLOCK_SIZE}")
+    fused_inter_dim = GROUP_DIM * SPLIT_K_PER_CTA
+    if inter_dim % fused_inter_dim != 0:
+        raise ValueError(
+            f"inter_dim must be a multiple of {fused_inter_dim} for fused split-K stage2 "
+            f"(got {inter_dim})"
+        )
 
     if not isinstance(topk, int) or topk <= 0:
         raise ValueError(f"topk must be a positive int (got {topk})")
@@ -1335,13 +1484,14 @@ def _fused_moe_fp8_blockscale_g1u1_impl(
     # on the host: doing so breaks CUDA graph capture.  The kernel guards each
     # speculative route group using num_valid_ids[0].
     split_k = _ceil_div(inter_dim, GROUP_DIM)
+    split_k_ctas = _ceil_div(split_k, SPLIT_K_PER_CTA)
     route_groups = max(1, sorted_expert_ids.numel())
     persistent_route_step = 0
     if num_persistent_tgs > 0:
-        persistent_route_groups = _ceil_div(num_persistent_tgs, split_k)
+        persistent_route_groups = _ceil_div(num_persistent_tgs, split_k_ctas)
         route_groups = min(route_groups, max(1, persistent_route_groups))
         persistent_route_step = route_groups
-    grid = (split_k, route_groups, 1)
+    grid = (split_k_ctas, route_groups, 1)
     block = (THREADS, 1, 1)
 
     sorted_token_ids_i32 = sorted_token_ids.to(dtype=torch.int32)

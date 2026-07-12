@@ -40,6 +40,11 @@ def _validate_shape(tokens: int, dim: int, inter_dim: int, experts: int, topk: i
             raise ValueError(
                 f"{name} must be a positive multiple of {SCALE_BLOCK_SIZE}, got {value}"
             )
+    fused_inter_dim = GROUP_DIM * fused_moe.SPLIT_K_PER_CTA
+    if inter_dim % fused_inter_dim != 0:
+        raise ValueError(
+            f"inter_dim must be a multiple of {fused_inter_dim} for fused split-K stage2, got {inter_dim}"
+        )
     if experts <= 0:
         raise ValueError(f"experts must be positive, got {experts}")
     if topk <= 0 or topk > experts:
@@ -235,8 +240,9 @@ def _make_avelang_kernel_launcher(
     tokens, dim = input_q.shape
     inter_dim = w2_q.shape[-1]
     split_k = (inter_dim + GROUP_DIM - 1) // GROUP_DIM
+    split_k_ctas = (split_k + fused_moe.SPLIT_K_PER_CTA - 1) // fused_moe.SPLIT_K_PER_CTA
     route_groups = max(1, sorted_expert_ids.numel())
-    grid = (split_k, route_groups, 1)
+    grid = (split_k_ctas, route_groups, 1)
     block = (fused_moe.THREADS, 1, 1)
 
     sorted_token_ids_i32 = sorted_token_ids.to(dtype=torch.int32)
