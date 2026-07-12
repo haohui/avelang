@@ -137,8 +137,9 @@ def _w13_load_tile_stage0(
     wid: S.u32,
     wtid: S.u32,
 ):
+    wid_s = S.amdgpu.readfirstlane(wid)
     vindex = wtid * 16
-    soffset = v_offset_bytes + wid * 16 * stride_n
+    soffset = v_offset_bytes + wid_s * 16 * stride_n
     row_stride_bytes = WARP_SIZE * stride_n
     for i in S.range(4):
         for j in S.range(2):
@@ -159,8 +160,9 @@ def _w13_load_tile_stage1(
     wid: S.u32,
     wtid: S.u32,
 ):
+    wid_s = S.amdgpu.readfirstlane(wid)
     vindex = wtid * 16
-    soffset = v_offset_bytes + wid * 16 * stride_n
+    soffset = v_offset_bytes + wid_s * 16 * stride_n
     row_stride_bytes = WARP_SIZE * stride_n
     for i in S.range(4):
         for j in S.range(2):
@@ -193,8 +195,9 @@ def _w2_load_tile_stage0(
     wid: S.u32,
     wtid: S.u32,
 ):
+    wid_s = S.amdgpu.readfirstlane(wid)
     vindex = wtid * 16
-    soffset = v_offset_bytes + wid * 16 * stride_n
+    soffset = v_offset_bytes + wid_s * 16 * stride_n
     inner_step = WARP_SIZE * 16
     for i in S.range(2):
         for j in S.range(4):
@@ -215,8 +218,9 @@ def _w2_load_tile_stage1(
     wid: S.u32,
     wtid: S.u32,
 ):
+    wid_s = S.amdgpu.readfirstlane(wid)
     vindex = wtid * 16
-    soffset = v_offset_bytes + wid * 16 * stride_n
+    soffset = v_offset_bytes + wid_s * 16 * stride_n
     inner_step = WARP_SIZE * 16
     for i in S.range(2):
         for j in S.range(4):
@@ -249,7 +253,8 @@ def _input_fetch_async(
     wtid: S.u32,
     tokens: S.Tensor((TOKEN_BATCH,), S.u32),
 ):
-    warp_base_bytes = (shm_x_base + wid * INPUT_SHM_ELEMENTS_PER_WARP) * 4
+    wid_s = S.amdgpu.readfirstlane(wid)
+    warp_base_bytes = (shm_x_base + wid_s * INPUT_SHM_ELEMENTS_PER_WARP) * 4
     vindex = wtid * 4
     for i in S.range(TOKEN_BATCH):
         src_off = tokens[i] * dim + d
@@ -289,12 +294,13 @@ def _input_fetch_scale_async(
     token_select_x: S.u32,
     token_select_y: S.u32,
 ):
+    wid_s = S.amdgpu.readfirstlane(wid)
     token_off = token_select_x * 4
-    if (wid & 1) != 0:
+    if (wid_s & 1) != 0:
         token_off = token_select_y * 4
     scale_block_pair = d // GROUP_DIM
-    src_off = (wid // 2) * m * 4 + scale_block_pair * (m * 2 * 4)
-    lds_off = (shm_scale_base + wid * WARP_SIZE) * 4
+    src_off = (wid_s // 2) * m * 4 + scale_block_pair * (m * 2 * 4)
+    lds_off = (shm_scale_base + wid_s * WARP_SIZE) * 4
     S.amdgpu.raw_buffer_load_x1_lds(
         scales_rsrc,
         shared_words,
@@ -1027,12 +1033,13 @@ def _fused_moe_blockscale_fp8_kernel(
     tile_k = S.block_id(0)
     route_group_begin = S.block_id(1)
     wid = tid // WARP_SIZE
+    wid_route = S.amdgpu.readfirstlane(wid)
     wtid = tid % WARP_SIZE
     col_id = tid % SUBGROUP_SIZE
 
     g_num_valid_ids = S.make_tensor(num_valid_ids_ptr, S.u32, S.make_layout((2,), (1,)))
-    num_valid_ids = g_num_valid_ids[0]
-    num_tokens = g_num_valid_ids[1]
+    num_valid_ids = S.amdgpu.readfirstlane(g_num_valid_ids[0])
+    num_tokens = S.amdgpu.readfirstlane(g_num_valid_ids[1])
     num_valid_m_blocks = (num_valid_ids + ROUTES_PER_BLOCK - 1) // ROUTES_PER_BLOCK
     route_group_limit = num_valid_m_blocks
     route_group_end = route_group_begin + 1
@@ -1083,6 +1090,7 @@ def _fused_moe_blockscale_fp8_kernel(
             expert_id = S.amdgpu.raw_buffer_load_x1(
                 sorted_expert_ids_rsrc, zero, route_group * 4, 0
             )
+            expert_id = S.amdgpu.readfirstlane(expert_id)
             token_select_x = S.amdgpu.raw_buffer_load_x1(
                 sorted_token_ids_rsrc, col_id * 4, route_base_bytes, 0
             ) & 0x00FFFFFF
@@ -1095,10 +1103,11 @@ def _fused_moe_blockscale_fp8_kernel(
 
             tokens = S.make_local((TOKEN_BATCH,), S.u32)
             for i in S.range(TOKEN_BATCH):
-                token_idx = wid + i * 4
+                token_idx = wid_route + i * 4
                 tokens[i] = S.amdgpu.raw_buffer_load_x1(
                     sorted_token_ids_rsrc, token_idx * 4, route_base_bytes, 0
                 ) & 0x00FFFFFF
+                tokens[i] = S.amdgpu.readfirstlane(tokens[i])
 
             invalid_token_mask = S.convert(0, S.u32)
             for i in S.range(TOKEN_BATCH):
