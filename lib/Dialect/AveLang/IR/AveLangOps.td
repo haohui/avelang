@@ -164,6 +164,65 @@ def FullOp : AveLang_Op<"full", [Pure]> {
     let hasVerifier = 1;
 }
 
+def TagBindOp : AveLang_Op<"tag.bind"> {
+    let summary = "Bind a compile-time tag function to a memref-like value";
+    let description = [{
+        The `ave.tag.bind` operation records an invariant tag function for
+        a source tensor or tile. Validation passes consume the op and transfer
+        the payload to attributes for later analysis.
+    }];
+
+    let arguments = (ins
+        AnyType:$target,
+        Variadic<AnyType>:$captures,
+        OptionalAttr<StrAttr>:$tag_name,
+        StrArrayAttr:$tag_inputs,
+        StrArrayAttr:$tag_capture_names,
+        StrArrayAttr:$tag_exprs
+    );
+    let results = (outs);
+
+    let assemblyFormat = [{
+        $target (`,` $captures^ `:` type($captures))? attr-dict `:` type($target)
+    }];
+
+    let hasVerifier = 1;
+}
+
+def TagAssertEqOp : AveLang_Op<"tag.assert_eq"> {
+    let summary = "Assert that two values have equal compile-time tags";
+    let description = [{
+        The `ave.tag.assert_eq` operation records a compile-time tag
+        equality assertion for a later invariant-validation pass.
+    }];
+
+    let arguments = (ins AnyType:$lhs, AnyType:$rhs);
+    let results = (outs);
+
+    let assemblyFormat = [{
+        $lhs `,` $rhs attr-dict `:` type($lhs) `,` type($rhs)
+    }];
+
+    let hasVerifier = 1;
+}
+
+def TagResetOp : AveLang_Op<"tag.reset"> {
+    let summary = "Reset tag state associated with a memref-like value";
+    let description = [{
+        The `ave.tag.reset` operation marks a shared-memory value as
+        having its compile-time tags reset back to bottom.
+    }];
+
+    let arguments = (ins AnyType:$target);
+    let results = (outs);
+
+    let assemblyFormat = [{
+        $target attr-dict `:` type($target)
+    }];
+
+    let hasVerifier = 1;
+}
+
 
 //===----------------------------------------------------------------------===//
 // GPU Operations

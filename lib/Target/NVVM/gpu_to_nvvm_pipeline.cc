@@ -1,4 +1,6 @@
 #include "gpu_to_nvvm_pipeline.h"
+#include "Dialect/AveLang/Transforms/cleanup_memref_view_cast_pass.h"
+#include "Analysis/late_validate_invariant_tags_pass.h"
 #include "Dialect/AveLang/Transforms/normalize_ave_lang_return_pass.h"
 
 #include <mlir/Conversion/AffineToStandard/AffineToStandard.h>
@@ -8,6 +10,7 @@
 #include <mlir/Dialect/Affine/Passes.h>
 #include <mlir/Dialect/Bufferization/Transforms/OneShotAnalysis.h>
 #include <mlir/Dialect/Bufferization/Transforms/Passes.h>
+#include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/Dialect/GPU/Transforms/Passes.h>
 #include <mlir/Dialect/MemRef/Transforms/Passes.h>
 #include <mlir/Pass/PassManager.h>
@@ -39,6 +42,22 @@ static void buildCommonPassPipeline(OpPassManager &pm,
 
     // Add final canonicalization to clean up after conversion
     pm.addPass(createCanonicalizerPass());
+    pm.addPass(createCSEPass());
+    pm.addNestedPass<func::FuncOp>(
+        causalflow::avelang::dialect::createCleanupMemRefViewCastPass());
+    pm.addNestedPass<gpu::GPUFuncOp>(
+        causalflow::avelang::dialect::createCleanupMemRefViewCastPass());
+    pm.addPass(createCanonicalizerPass());
+    pm.addPass(createCSEPass());
+    pm.addNestedPass<func::FuncOp>(createMem2Reg());
+    pm.addNestedPass<gpu::GPUFuncOp>(createMem2Reg());
+    pm.addPass(createCanonicalizerPass());
+    pm.addPass(createCSEPass());
+    pm.addPass(
+        causalflow::avelang::analysis::createLateValidateInvariantTagsPass(
+            options.validate_invariants));
+    pm.addPass(createCanonicalizerPass());
+    pm.addPass(createCSEPass());
 }
 
 /// Build the GPU pass pipeline for GPU module-specific transformations.

@@ -1,5 +1,6 @@
 add_library(ave-lang-dialect-transforms
   allocation_op_interface_impl.cc
+  cleanup_memref_view_cast_pass.cc
   hoist_alloca_pass.cc
   normalize_ave_lang_return_pass.cc
   lower_ave_lang_to_memref_pass.cc

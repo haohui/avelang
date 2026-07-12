@@ -21,6 +21,7 @@ target_link_libraries(ave-lang-target-nvvm
   MLIRMemRefTransforms
   MLIRUBToLLVM
   ave-lang-mlir
+  ave-lang-analysis
   ave-lang-dialect-transforms
   LLVMNVPTXCodeGen
   LLVMNVPTXInfo

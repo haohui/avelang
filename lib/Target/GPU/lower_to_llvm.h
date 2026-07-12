@@ -26,6 +26,9 @@ struct GPUCompilationOptions {
     /// Number of warps (or waves) requested by the frontend. -1 means unset.
     int num_warps = -1;
 
+    /// Run compile-time data-flow invariant proofs.
+    bool validate_invariants = false;
+
     /// Use bare pointer calling convention for memref
     bool use_bare_ptr_memref_call_conv = true;
 

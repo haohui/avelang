@@ -1535,6 +1535,11 @@ mlir::Value ExprGenerator::VisitCall(ast::Call *call) {
     llvm::SmallVector<mlir::Value> resolved_args;
     resolved_args.reserve(call->GetArgs().size());
     for (auto *arg_expr : call->GetArgs()) {
+        if (llvm::isa<ast::Lambda>(arg_expr)) {
+            resolved_args.emplace_back();
+            continue;
+        }
+
         // Skip dispatch for type-like expressions (attribute access such as
         // avelang.f32 or factory calls like avelang.Tensor(...))
         if (llvm::isa<ast::AttributeExpr>(arg_expr)) {

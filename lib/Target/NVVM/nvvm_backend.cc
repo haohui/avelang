@@ -24,6 +24,7 @@ void NVVMBackend::buildLoweringPipeline(
     nvvmOptions.triple = options.triple.str();
     nvvmOptions.optimization_level = options.optimization_level;
     nvvmOptions.num_warps = options.num_warps;
+    nvvmOptions.validate_invariants = options.validate_invariants;
     nvvmOptions.use_bare_ptr_memref_call_conv =
         options.use_bare_ptr_memref_call_conv;
 

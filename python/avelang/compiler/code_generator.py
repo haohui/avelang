@@ -275,4 +275,7 @@ def compile_to_binary(src, target, opt_level: int = 2, options=None):
     generator.visit_function_def(kernel_func, constexprs_json, "kernel")
 
     num_warps = getattr(options, "num_warps", -1)
-    return generator.compile_to_binary_bytes(target.tuple, target.chip, opt_level, num_warps)
+    validate_invariants = getattr(options, "validate_invariants", False)
+    return generator.compile_to_binary_bytes(
+        target.tuple, target.chip, opt_level, num_warps, validate_invariants
+    )

@@ -26,6 +26,7 @@
 #include <mlir/Transforms/GreedyPatternRewriteDriver.h>
 
 #include <llvm/ADT/DenseMap.h>
+#include <llvm/Support/FormatVariadic.h>
 #include <llvm/Support/MathExtras.h>
 #include <numeric>
 #include <optional>
@@ -136,6 +137,34 @@ std::optional<int64_t> getStaticByteSize(mlir::MemRefType type) {
         return std::nullopt;
     }
     return (*elemBytes) * (*elemCount);
+}
+
+static std::optional<mlir::DictionaryAttr> getInvariantTagAttr(mlir::Value value) {
+    if (auto arg = mlir::dyn_cast<mlir::BlockArgument>(value)) {
+        auto func = mlir::dyn_cast<mlir::FunctionOpInterface>(arg.getOwner()->getParentOp());
+        if (func && arg.getOwner() == &func.getFunctionBody().front())
+            return mlir::dyn_cast_or_null<mlir::DictionaryAttr>(
+                func.getArgAttr(arg.getArgNumber(), "avelang.invariant.tag"));
+    }
+    if (auto result = mlir::dyn_cast<mlir::OpResult>(value))
+        return mlir::dyn_cast_or_null<mlir::DictionaryAttr>(result.getOwner()->getAttr(
+            llvm::formatv("avelang.invariant.tag.{0}", result.getResultNumber()).str()));
+    return std::nullopt;
+}
+
+static void propagateInvariantTagAttr(mlir::Value from, mlir::Value to) {
+    auto attr = getInvariantTagAttr(from);
+    // dyn_cast_or_null may produce a null DictionaryAttr wrapped in an
+    // optional; never attempt to install such an attribute on the lowered op.
+    if (!attr || !*attr) return;
+    if (auto arg = mlir::dyn_cast<mlir::BlockArgument>(to)) {
+        if (auto func = mlir::dyn_cast<mlir::FunctionOpInterface>(arg.getOwner()->getParentOp());
+            func && arg.getOwner() == &func.getFunctionBody().front())
+            func.setArgAttr(arg.getArgNumber(), "avelang.invariant.tag", *attr);
+    } else if (auto result = mlir::dyn_cast<mlir::OpResult>(to)) {
+        result.getOwner()->setAttr(
+            llvm::formatv("avelang.invariant.tag.{0}", result.getResultNumber()).str(), *attr);
+    }
 }
 
 bool extractTupleValues(mlir::Value tupleValue,
@@ -507,6 +536,8 @@ mlir::LogicalResult lowerFunctionArgsToI8(mlir::ModuleOp module) {
                             builder.getIndexAttr(0), sizeOfrs, strideOfrs);
                     castResult = reinterpretOp.getResult();
                 }
+
+                propagateInvariantTagAttr(arg, castResult);
 
                 arg.replaceAllUsesExcept(castResult, view);
             }
@@ -1166,6 +1197,7 @@ mlir::LogicalResult AveLangMemRefAllocaLoweringPattern::matchAndRewrite(
         if (!typedResult) {
             return mlir::failure();
         }
+        propagateInvariantTagAttr(op.getResult(), typedResult);
         rewriter.replaceOp(op, typedResult);
         return mlir::success();
     }
@@ -1215,6 +1247,7 @@ mlir::LogicalResult AveLangMemRefAllocaLoweringPattern::matchAndRewrite(
         castResult = reinterpretOp.getResult();
     }
 
+    propagateInvariantTagAttr(op.getResult(), castResult);
     rewriter.replaceOp(op, castResult);
     return mlir::success();
 }
@@ -1300,8 +1333,10 @@ mlir::LogicalResult AveLangMemRefViewLoweringPattern::matchAndRewrite(
     auto viewType = withResolvedMemorySpace(
         rewriter.getContext(), resultType,
         sourceType ? sourceType.getMemorySpace() : mlir::Attribute{});
-    rewriter.replaceOpWithNewOp<mlir::memref::ViewOp>(
-        op, viewType, op.getSource(), op.getByteShift(), op.getSizes());
+    auto newView = rewriter.create<mlir::memref::ViewOp>(
+        op.getLoc(), viewType, op.getSource(), op.getByteShift(), op.getSizes());
+    propagateInvariantTagAttr(op.getResult(), newView.getResult());
+    rewriter.replaceOp(op, newView.getResult());
     return mlir::success();
 }
 
@@ -1484,6 +1519,7 @@ mlir::LogicalResult AveLangMemRefCastLoweringPattern::matchAndRewrite(
             }
         }
 
+        propagateInvariantTagAttr(op.getResult(), reinterpretOp.getResult());
         rewriter.replaceOp(op, reinterpretOp.getResult());
         return mlir::success();
     }
@@ -1502,6 +1538,7 @@ mlir::LogicalResult AveLangMemRefCastLoweringPattern::matchAndRewrite(
                                              baseInfo->byteShift, sizeValues);
 
     if (!needReinterpret) {
+        propagateInvariantTagAttr(op.getResult(), view.getResult());
         rewriter.replaceOp(op, view.getResult());
         return mlir::success();
     }
@@ -1530,6 +1567,7 @@ mlir::LogicalResult AveLangMemRefCastLoweringPattern::matchAndRewrite(
         }
     }
 
+    propagateInvariantTagAttr(op.getResult(), reinterpretOp.getResult());
     rewriter.replaceOp(op, reinterpretOp.getResult());
     return mlir::success();
 }
@@ -1636,6 +1674,7 @@ mlir::LogicalResult AveLangMemRefSubViewLoweringPattern::matchAndRewrite(
         rewriter, op.getLoc(), inferredType, op.getSource(), offsetsFold,
         sizesFold, stridesFold);
 
+    propagateInvariantTagAttr(op.getResult(), subview.getResult());
     rewriter.replaceOp(op, subview.getResult());
     return mlir::success();
 }

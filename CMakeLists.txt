@@ -70,6 +70,9 @@ find_package(zstd CONFIG REQUIRED)
 find_package(LLVM CONFIG REQUIRED)
 find_package(MLIR CONFIG REQUIRED)
 find_package(Clang REQUIRED CONFIG)
+find_program(Z3_EXECUTABLE NAMES z3 REQUIRED)
+set(Z3_EXECUTABLE "${Z3_EXECUTABLE}" CACHE FILEPATH "Path to Z3 executable")
+add_compile_definitions(AVELANG_Z3_EXECUTABLE="${Z3_EXECUTABLE}")
 
 # Locate build tool executables using paths exported by LLVM/MLIR packages.
 if(NOT MLIR_OPT_EXECUTABLE)

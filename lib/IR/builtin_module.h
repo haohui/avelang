@@ -88,9 +88,19 @@ class AveLangModule : public NamedModule {
     mlir::Value
     CreateViewFunction(ast::Call *call_expr, GeneratorContext *ctx,
                        llvm::ArrayRef<mlir::Value> resolved_args) const;
+    mlir::Value
+    CreateTagBindFunction(ast::Call *call_expr, GeneratorContext *ctx,
+                          llvm::ArrayRef<mlir::Value> resolved_args) const;
+    mlir::Value
+    CreateTagAssertEqFunction(ast::Call *call_expr, GeneratorContext *ctx,
+                              llvm::ArrayRef<mlir::Value> resolved_args) const;
+    mlir::Value
+    CreateTagResetFunction(ast::Call *call_expr, GeneratorContext *ctx,
+                           llvm::ArrayRef<mlir::Value> resolved_args) const;
 
   private:
     IRContext *ir_context_;
+    std::unique_ptr<NamedModule> invariant_module_;
     std::unique_ptr<NamedModule> nvvm_module_;
     std::unique_ptr<NamedModule> amdgpu_module_;
 };

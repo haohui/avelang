@@ -31,6 +31,7 @@ toGPUOptions(const CompilationOptions &Options) {
     GPUOptions.triple = Options.TargetTriple;
     GPUOptions.optimization_level = Options.OptLevel;
     GPUOptions.num_warps = Options.NumWarps;
+    GPUOptions.validate_invariants = Options.ValidateInvariants;
     GPUOptions.use_bare_ptr_memref_call_conv = Options.UseBarePointerCallConv;
     return GPUOptions;
 }

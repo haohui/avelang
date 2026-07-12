@@ -107,6 +107,7 @@ class AveLangCompiler {
                     const std::string &target_triple = "amdgcn-amd-amdhsa",
                     const std::string &target_chipset = "gfx90a",
                     unsigned opt_level = 2, int num_warps = -1,
+                    bool validate_invariants = false,
                     const std::string &constexprs_json = "[]") {
 
         // Create compilation options
@@ -115,6 +116,7 @@ class AveLangCompiler {
         options.TargetChipset = target_chipset;
         options.OptLevel = opt_level;
         options.NumWarps = num_warps;
+        options.ValidateInvariants = validate_invariants;
         options.Stage = causalflow::avelang::driver::OutputStage::Binary;
 
         // Create memory buffer from source
@@ -139,10 +141,12 @@ class AveLangCompiler {
                                    const std::string &target_triple,
                                    const std::string &target_chipset,
                                    unsigned opt_level = 2, int num_warps = -1,
+                                   bool validate_invariants = false,
                                    const std::string &constexprs_json = "[]") {
         std::string binary =
             compileToBinary(source_code, target_triple, target_chipset,
-                            opt_level, num_warps, constexprs_json);
+                            opt_level, num_warps, validate_invariants,
+                            constexprs_json);
         return py::bytes(binary);
     }
 
@@ -174,7 +178,8 @@ class AveLangMLIRGenerator {
                             unsigned opt_level, int num_warps = -1);
     py::bytes CompileToBinaryBytes(const std::string &target_triple,
                                    const std::string &target_chipset,
-                                   unsigned opt_level, int num_warps = -1);
+                                   unsigned opt_level, int num_warps = -1,
+                                   bool validate_invariants = false);
 
   private:
     void ClearMLIRDiagnostics();
@@ -446,7 +451,8 @@ std::string AveLangMLIRGenerator::GetAssembly(const std::string &target_triple,
 py::bytes
 AveLangMLIRGenerator::CompileToBinaryBytes(const std::string &target_triple,
                                            const std::string &target_chipset,
-                                           unsigned opt_level, int num_warps) {
+                                           unsigned opt_level, int num_warps,
+                                           bool validate_invariants) {
     auto module = generator_.GetModule();
     ThrowIfDiagnosticsFailed(
         "Failed to lower MLIR to LLVM IR due to compiler diagnostics");
@@ -460,6 +466,7 @@ AveLangMLIRGenerator::CompileToBinaryBytes(const std::string &target_triple,
     options.chipset = target_chipset;
     options.optimization_level = opt_level;
     options.num_warps = num_warps;
+    options.validate_invariants = validate_invariants;
 
     auto backend =
         target::gpu::GPUBackendRegistry::getInstance().createBackendForTriple(
@@ -499,6 +506,7 @@ PYBIND11_MODULE(_avelang_bindings, m) {
              "Compile avelang source to binary bytes", py::arg("source_code"),
              py::arg("target_triple"), py::arg("target_chipset"),
              py::arg("opt_level") = 2, py::arg("num_warps") = -1,
+             py::arg("validate_invariants") = false,
              py::arg("constexprs_json") = "[]");
 
     py::class_<AveLangMLIRGenerator>(m, "MLIRGenerator")
@@ -525,5 +533,6 @@ PYBIND11_MODULE(_avelang_bindings, m) {
         .def("compile_to_binary_bytes",
              &AveLangMLIRGenerator::CompileToBinaryBytes,
              py::arg("target_triple"), py::arg("target_chipset"),
-             py::arg("opt_level"), py::arg("num_warps") = -1);
+             py::arg("opt_level"), py::arg("num_warps") = -1,
+             py::arg("validate_invariants") = false);
 }
