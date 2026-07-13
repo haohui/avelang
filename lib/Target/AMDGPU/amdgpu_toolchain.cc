@@ -4,7 +4,9 @@
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/Path.h>
 #include <llvm/Support/Process.h>
+#include <cstdlib>
 #include <sstream>
+#include <string>
 
 namespace causalflow::avelang::target::amdgpu {
 
@@ -77,6 +79,12 @@ std::vector<std::string> Linker::constructLinkerArgs(
     args.push_back("-amdgpu-early-inline-all=true");
     args.push_back("-mllvm");
     args.push_back("-amdgpu-function-calls=false");
+
+    const char *enableMoeOpt = std::getenv("ENABLE_MOE_OPT");
+    if (enableMoeOpt != nullptr && std::string(enableMoeOpt) == "1") {
+        args.push_back("-Xlinker");
+        args.push_back("-plugin-opt=-amdgpu-mfma-vgpr-form=true");
+    }
 
     // Add input object file
     args.push_back(inputFile);

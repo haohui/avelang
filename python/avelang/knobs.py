@@ -17,6 +17,8 @@ propagate_env = True
 CC_ENV = "CC"
 CXX_ENV = "CXX"
 LD_LIBRARY_PATH_ENV = "LD_LIBRARY_PATH"
+ENABLE_ATTN_OPT_ENV = "ENABLE_ATTN_OPT"
+ENABLE_MOE_OPT_ENV = "ENABLE_MOE_OPT"
 
 
 def getenv(key: str, default: Optional[str] = None) -> Optional[str]:
@@ -173,4 +175,10 @@ class build_knobs(base_knobs):
     ld_library_path: env_opt_str = env_opt_str(LD_LIBRARY_PATH_ENV)
 
 
+class amdgpu_knobs(base_knobs):
+    enable_attn_opt: env_bool = env_bool(ENABLE_ATTN_OPT_ENV)
+    enable_moe_opt: env_bool = env_bool(ENABLE_MOE_OPT_ENV)
+
+
 build = build_knobs()
+amdgpu = amdgpu_knobs()
