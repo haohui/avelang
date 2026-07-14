@@ -530,8 +530,18 @@ class AMDGPUMfmaLowering : public mlir::OpRewritePattern<AMDGPUMfmaOp> {
         auto bVec = prepareArg(b, desiredBElem, desiredBCount);
         auto cVec = prepareArg(c, desiredCElem, desiredCCount);
 
+        llvm::StringRef intrinsic = config->intrinsic;
+        llvm::StringRef variant = op.getVariantAttr().getValue();
+        if (variant == "tied" &&
+            intrinsic == "rocdl_mfma_f32_16x16x16bf16_1k") {
+            intrinsic = "llvm_amdgcn_mfma_f32_16x16x16bf16_1k_tied";
+        } else if (variant == "vgprcd" &&
+                   intrinsic == "rocdl_mfma_f32_16x16x32_fp8_fp8") {
+            intrinsic = "llvm_amdgcn_mfma_f32_16x16x32_fp8_fp8_vgprcd";
+        }
+
         auto funcName =
-            ir::intrinsics::MakeIntrinsicFuncName("amdgpu", config->intrinsic);
+            ir::intrinsics::MakeIntrinsicFuncName("amdgpu", intrinsic);
 
         auto callOp = mlir::func::CallOp::create(
             rewriter, op.getLoc(), funcName, mlir::TypeRange{resultType},
