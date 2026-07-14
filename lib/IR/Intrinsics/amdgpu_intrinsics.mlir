@@ -41,6 +41,14 @@ module {
     return %3 : vector<4xf32>
   }
 
+  func.func private @_avelang_amdgpu_llvm_amdgcn_mfma_f32_16x16x16bf16_1k_tied(%arg0: vector<2xi32>, %arg1: vector<2xi32>, %arg2: vector<4xf32>) -> vector<4xf32> attributes {func.inline = "always"} {
+    %c0_i32 = arith.constant 0 : i32
+    %a_i16 = vector.bitcast %arg0 : vector<2xi32> to vector<4xi16>
+    %b_i16 = vector.bitcast %arg1 : vector<2xi32> to vector<4xi16>
+    %3 = llvm.call_intrinsic "llvm.amdgcn.mfma.f32.16x16x16bf16.1k.tied"(%a_i16, %b_i16, %arg2, %c0_i32, %c0_i32, %c0_i32) : (vector<4xi16>, vector<4xi16>, vector<4xf32>, i32, i32, i32) -> vector<4xf32>
+    return %3 : vector<4xf32>
+  }
+
   func.func private @_avelang_amdgpu_rocdl_mfma_f32_32x32x8bf16_1k(%arg0: vector<2xi32>, %arg1: vector<2xi32>, %arg2: vector<16xf32>) -> vector<16xf32> attributes {func.inline = "always"} {
     %c0_i32 = arith.constant 0 : i32
     %a_i16 = vector.bitcast %arg0 : vector<2xi32> to vector<4xi16>
@@ -56,6 +64,16 @@ module {
     %a_i64 = vector.extract %a_v1[0] : i64 from vector<1xi64>
     %b_i64 = vector.extract %b_v1[0] : i64 from vector<1xi64>
     %3 = rocdl.mfma.f32.16x16x32.fp8.fp8 %a_i64, %b_i64, %arg2, %c0_i32, %c0_i32, %c0_i32 : (i64, i64, vector<4xf32>, i32, i32, i32) -> vector<4xf32>
+    return %3 : vector<4xf32>
+  }
+
+  func.func private @_avelang_amdgpu_llvm_amdgcn_mfma_f32_16x16x32_fp8_fp8_vgprcd(%arg0: vector<2xi32>, %arg1: vector<2xi32>, %arg2: vector<4xf32>) -> vector<4xf32> attributes {func.inline = "always"} {
+    %c0_i32 = arith.constant 0 : i32
+    %a_v1 = vector.bitcast %arg0 : vector<2xi32> to vector<1xi64>
+    %b_v1 = vector.bitcast %arg1 : vector<2xi32> to vector<1xi64>
+    %a_i64 = vector.extract %a_v1[0] : i64 from vector<1xi64>
+    %b_i64 = vector.extract %b_v1[0] : i64 from vector<1xi64>
+    %3 = llvm.call_intrinsic "llvm.amdgcn.mfma.f32.16x16x32.fp8.fp8.vgprcd"(%a_i64, %b_i64, %arg2, %c0_i32, %c0_i32, %c0_i32) : (i64, i64, vector<4xf32>, i32, i32, i32) -> vector<4xf32>
     return %3 : vector<4xf32>
   }
 

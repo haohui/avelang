@@ -78,6 +78,13 @@ std::vector<std::string> Linker::constructLinkerArgs(
     args.push_back("-mllvm");
     args.push_back("-amdgpu-function-calls=false");
 
+    const char *hackMfmaVgprFormEnv = std::getenv("HACK_MFMA_VGPR_FORM");
+    if (hackMfmaVgprFormEnv != nullptr &&
+        std::string(hackMfmaVgprFormEnv) == "1") {
+        args.push_back("-Xlinker");
+        args.push_back("-plugin-opt=-amdgpu-mfma-vgpr-form=true");
+    }
+
     // Add input object file
     args.push_back(inputFile);
 
