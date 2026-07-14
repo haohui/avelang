@@ -17,8 +17,7 @@ propagate_env = True
 CC_ENV = "CC"
 CXX_ENV = "CXX"
 LD_LIBRARY_PATH_ENV = "LD_LIBRARY_PATH"
-ENABLE_ATTN_OPT_ENV = "ENABLE_ATTN_OPT"
-ENABLE_MOE_OPT_ENV = "ENABLE_MOE_OPT"
+HACK_SINGLE_WAVE_PER_EU_ENV = "HACK_SINGLE_WAVE_PER_EU"
 
 
 def getenv(key: str, default: Optional[str] = None) -> Optional[str]:
@@ -176,8 +175,7 @@ class build_knobs(base_knobs):
 
 
 class amdgpu_knobs(base_knobs):
-    enable_attn_opt: env_bool = env_bool(ENABLE_ATTN_OPT_ENV)
-    enable_moe_opt: env_bool = env_bool(ENABLE_MOE_OPT_ENV)
+    hack_single_wave_per_eu: env_bool = env_bool(HACK_SINGLE_WAVE_PER_EU_ENV)
 
 
 build = build_knobs()

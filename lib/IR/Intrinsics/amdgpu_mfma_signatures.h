@@ -26,6 +26,7 @@ struct MFMAConfig {
     llvm::StringRef intrinsic;
     VectorElemKind aElem;
     VectorElemKind cElem;
+    llvm::StringRef variant;
 
     static constexpr unsigned kWarpSize = 64;
 
@@ -74,6 +75,18 @@ struct MFMAConfig {
                 "rocdl_mfma_f32_16x16x16bf16_1k",
                 VectorElemKind::BF16,
                 VectorElemKind::F32,
+            },
+            {
+                "mfma_16x16x16_bf16_f32_tied",
+                16,
+                16,
+                16,
+                "bf16",
+                "f32",
+                "llvm_amdgcn_mfma_f32_16x16x16bf16_1k_tied",
+                VectorElemKind::BF16,
+                VectorElemKind::F32,
+                "tied",
             },
             {
                 "mfma_f32_16x16x16_bf16",
@@ -129,6 +142,18 @@ struct MFMAConfig {
                 "rocdl_mfma_f32_16x16x32_fp8_fp8",
                 VectorElemKind::FP8,
                 VectorElemKind::F32,
+            },
+            {
+                "mfma_f32_16x16x32_fp8_fp8_vgprcd",
+                16,
+                16,
+                32,
+                "fp8",
+                "f32",
+                "llvm_amdgcn_mfma_f32_16x16x32_fp8_fp8_vgprcd",
+                VectorElemKind::FP8,
+                VectorElemKind::F32,
+                "vgprcd",
             },
         };
 

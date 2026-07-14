@@ -57,14 +57,15 @@ class OverrideRocdlMaxFlatWorkgroupSizePass
         Builder builder(context);
         IntegerAttr attr = builder.getI32IntegerAttr(maxFlatWorkgroupSize);
         IntegerAttr wavesAttr = builder.getI32IntegerAttr(1);
-        const char *enableAttnOpt = std::getenv("ENABLE_ATTN_OPT");
-        const bool setWavesPerEu =
-            enableAttnOpt != nullptr && std::string(enableAttnOpt) == "1";
+        const char *singleWavePerEu =
+            std::getenv("HACK_SINGLE_WAVE_PER_EU");
+        const bool useSingleWavePerEu =
+            singleWavePerEu != nullptr && std::string(singleWavePerEu) == "1";
 
         gpuModule.walk([&](gpu::GPUFuncOp func) {
             if (func.isKernel()) {
                 maxFlatWorkgroupSizeAttr.setAttr(func, attr);
-                if (setWavesPerEu) {
+                if (useSingleWavePerEu) {
                     wavesPerEuAttr.setAttr(func, wavesAttr);
                 }
             }
