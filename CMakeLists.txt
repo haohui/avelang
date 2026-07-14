@@ -128,9 +128,7 @@ if(WITH_AMDGPU)
   # Extract ROCm paths from HIP package detection
   set(ROCM_ROOT_PATH "${HIP_PACKAGE_PREFIX_DIR}")
   set(ROCM_DEVICE_LIBRARY_PATH "${ROCM_ROOT_PATH}/amdgcn/bitcode")
-
-  # TODO: Temporarily prefer LLVM_TOOLS_BINARY_DIR for the custom clang; remove this once tool selection is configurable.
-  Set(ROCM_TOOL_PATHS "${LLVM_TOOLS_BINARY_DIR};${ROCM_ROOT_PATH}/bin;${ROCM_ROOT_PATH}/llvm/bin")
+  set(ROCM_TOOL_PATHS "${ROCM_ROOT_PATH}/bin;${ROCM_ROOT_PATH}/llvm/bin")
 
   message(STATUS "ROCm root path: ${ROCM_ROOT_PATH}")
   message(STATUS "ROCm device library path: ${ROCM_DEVICE_LIBRARY_PATH}")

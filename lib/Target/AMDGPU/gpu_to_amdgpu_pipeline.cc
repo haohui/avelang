@@ -22,10 +22,8 @@
 #include <mlir/Pass/PassManager.h>
 #include <mlir/Transforms/Passes.h>
 
-#include <cstdlib>
 #include <map>
 #include <sstream>
-#include <string>
 
 namespace causalflow::avelang::target::amdgpu {
 
@@ -53,21 +51,12 @@ class OverrideRocdlMaxFlatWorkgroupSizePass
         auto *rocdlDialect = context->getOrLoadDialect<ROCDL::ROCDLDialect>();
         auto maxFlatWorkgroupSizeAttr =
             rocdlDialect->getMaxFlatWorkGroupSizeAttrHelper();
-        auto wavesPerEuAttr = rocdlDialect->getWavesPerEuAttrHelper();
         Builder builder(context);
         IntegerAttr attr = builder.getI32IntegerAttr(maxFlatWorkgroupSize);
-        IntegerAttr wavesAttr = builder.getI32IntegerAttr(1);
-        const char *singleWavePerEu =
-            std::getenv("HACK_SINGLE_WAVE_PER_EU");
-        const bool useSingleWavePerEu =
-            singleWavePerEu != nullptr && std::string(singleWavePerEu) == "1";
 
         gpuModule.walk([&](gpu::GPUFuncOp func) {
             if (func.isKernel()) {
                 maxFlatWorkgroupSizeAttr.setAttr(func, attr);
-                if (useSingleWavePerEu) {
-                    wavesPerEuAttr.setAttr(func, wavesAttr);
-                }
             }
         });
     }

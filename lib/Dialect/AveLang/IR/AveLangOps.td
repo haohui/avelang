@@ -277,8 +277,7 @@ def AMDGPUMfmaOp : AveLang_GPU_Op<"amdgpu_mfma", []> {
         I32Attr:$n,
         I32Attr:$k,
         StrAttr:$type_a,
-        StrAttr:$type_c,
-        StrAttr:$variant
+        StrAttr:$type_c
     );
     let results = (outs LLVM_AnyVector:$result);
 

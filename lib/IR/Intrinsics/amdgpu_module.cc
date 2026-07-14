@@ -621,8 +621,7 @@ mlir::Value AMDGPUIntrinsic::CreateGenericMFMAFunction(
         mlir::IntegerAttr::get(builder.getI32Type(), config.n),
         mlir::IntegerAttr::get(builder.getI32Type(), config.k),
         mlir::StringAttr::get(builder.getContext(), config.typeA),
-        mlir::StringAttr::get(builder.getContext(), type_c_str),
-        mlir::StringAttr::get(builder.getContext(), config.variant));
+        mlir::StringAttr::get(builder.getContext(), type_c_str));
 
     return mfma_op.getResult();
 }

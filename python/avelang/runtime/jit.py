@@ -10,7 +10,6 @@ import re
 import hashlib
 import copy
 import itertools
-import os
 import threading
 from collections import defaultdict
 from functools import cached_property
@@ -805,14 +804,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
             backend, kwargs, bound_args, specialization, options
         )
 
-        cache_options = options
-        if target.tuple == "amdgcn-amd-amdhsa":
-            amdgpu_codegen_knobs = (
-                os.environ.get("HACK_SINGLE_WAVE_PER_EU") == "1",
-            )
-            cache_options = (options, amdgpu_codegen_knobs)
-
-        key = compute_cache_key(kernel_key_cache, specialization, cache_options)
+        key = compute_cache_key(kernel_key_cache, specialization, options)
         kernel = kernel_cache.get(key, None)
 
         # Kernel is not cached; we have to compile.

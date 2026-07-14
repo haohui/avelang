@@ -17,7 +17,6 @@ propagate_env = True
 CC_ENV = "CC"
 CXX_ENV = "CXX"
 LD_LIBRARY_PATH_ENV = "LD_LIBRARY_PATH"
-HACK_SINGLE_WAVE_PER_EU_ENV = "HACK_SINGLE_WAVE_PER_EU"
 
 
 def getenv(key: str, default: Optional[str] = None) -> Optional[str]:
@@ -174,9 +173,4 @@ class build_knobs(base_knobs):
     ld_library_path: env_opt_str = env_opt_str(LD_LIBRARY_PATH_ENV)
 
 
-class amdgpu_knobs(base_knobs):
-    hack_single_wave_per_eu: env_bool = env_bool(HACK_SINGLE_WAVE_PER_EU_ENV)
-
-
 build = build_knobs()
-amdgpu = amdgpu_knobs()

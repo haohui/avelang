@@ -19,10 +19,6 @@ def mfma_16x16x16_bf16_f32(a, b, c):
     pass
 
 
-def mfma_16x16x16_bf16_f32_tied(a, b, c):
-    pass
-
-
 def mfma_f32_16x16x16_bf16(a, b, c):
     pass
 
@@ -40,10 +36,6 @@ def mfma_16x16x32_fp8_fp8(a, b, c):
 
 
 def mfma_f32_16x16x32_fp8_fp8(a, b, c):
-    pass
-
-
-def mfma_f32_16x16x32_fp8_fp8_vgprcd(a, b, c):
     pass
 
 
