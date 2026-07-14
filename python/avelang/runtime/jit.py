@@ -809,6 +809,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
         if target.tuple == "amdgcn-amd-amdhsa":
             amdgpu_codegen_knobs = (
                 os.environ.get("HACK_SINGLE_WAVE_PER_EU") == "1",
+                os.environ.get("HACK_MFMA_VGPR_FORM") == "1",
             )
             cache_options = (options, amdgpu_codegen_knobs)
 

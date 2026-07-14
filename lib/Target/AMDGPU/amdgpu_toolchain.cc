@@ -77,6 +77,13 @@ std::vector<std::string> Linker::constructLinkerArgs(
     args.push_back("-amdgpu-early-inline-all=true");
     args.push_back("-mllvm");
     args.push_back("-amdgpu-function-calls=false");
+    if (auto mfmaVgprForm =
+            llvm::sys::Process::GetEnv("HACK_MFMA_VGPR_FORM")) {
+        if (*mfmaVgprForm == "1") {
+            args.push_back("-Xlinker");
+            args.push_back("-plugin-opt=-amdgpu-mfma-vgpr-form=true");
+        }
+    }
 
     // Add input object file
     args.push_back(inputFile);
